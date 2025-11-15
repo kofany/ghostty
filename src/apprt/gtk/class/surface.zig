@@ -2364,60 +2364,58 @@ pub const Surface = extern struct {
             const priv = self.private();
             const core_surface = priv.core_surface;
 
-            file_loop: {
-                var current: ?*glib.SList = list;
-                while (current) |item| : (current = item.f_next) {
-                    const file: *gio.File = @ptrCast(@alignCast(item.f_data orelse continue));
-                    const path = file.getPath() orelse continue;
-                    defer glib.free(path);
-                    const slice = std.mem.span(path);
+            var current: ?*glib.SList = list;
+            file_loop: while (current) |item| : (current = item.f_next) {
+                const file: *gio.File = @ptrCast(@alignCast(item.f_data orelse continue));
+                const path = file.getPath() orelse continue;
+                defer glib.free(path);
+                const slice = std.mem.span(path);
 
-                    if (core_surface) |surface| {
-                        if (surface.config.@"image-upload-enable") {
-                            var uploader = image_upload.Uploader{
-                                .allocator = alloc,
-                                .config = &surface.config,
-                            };
+                if (core_surface) |surface| {
+                    if (surface.config.@"image-upload-enable") {
+                        var uploader = image_upload.Uploader{
+                            .allocator = alloc,
+                            .config = &surface.config,
+                        };
 
-                            const result = uploader.upload(slice);
-                            defer result.deinit(alloc);
+                        const result = uploader.upload(slice);
+                        defer result.deinit(alloc);
 
-                            switch (result) {
-                                .success => |url| {
-                                    writer.writeAll(std.mem.span(url)) catch |err| {
-                                        log.err("unable to write uploaded URL to buffer: {}", .{err});
-                                        continue :file_loop;
-                                    };
-                                    writer.writeAll("\n") catch |err| {
-                                        log.err("unable to write to buffer: {}", .{err});
-                                        continue :file_loop;
-                                    };
+                        switch (result) {
+                            .success => |url| {
+                                writer.writeAll(std.mem.span(url)) catch |err| {
+                                    log.err("unable to write uploaded URL to buffer: {}", .{err});
                                     continue :file_loop;
-                                },
-                                .failure => |err| {
-                                    switch (surface.config.@"image-upload-fallback") {
-                                        .path => {},
-                                        .@"error" => {
-                                            log.err("image upload failed: {s}", .{err});
-                                            return 0;
-                                        },
-                                        .empty => continue :file_loop,
-                                    }
-                                },
-                                .fallback => {},
-                            }
+                                };
+                                writer.writeAll("\n") catch |err| {
+                                    log.err("unable to write to buffer: {}", .{err});
+                                    continue :file_loop;
+                                };
+                                continue :file_loop;
+                            },
+                            .failure => |err| {
+                                switch (surface.config.@"image-upload-fallback") {
+                                    .path => {},
+                                    .@"error" => {
+                                        log.err("image upload failed: {s}", .{err});
+                                        return 0;
+                                    },
+                                    .empty => continue :file_loop,
+                                }
+                            },
+                            .fallback => {},
                         }
                     }
-
-                    writer.writeAll(slice) catch |err| {
-                        log.err("unable to write path to buffer: {}", .{err});
-                        continue;
-                    };
-                    writer.writeAll("\n") catch |err| {
-                        log.err("unable to write to buffer: {}", .{err});
-                        continue;
-                    };
                 }
+
+                writer.writeAll(slice) catch |err| {
+                    log.err("unable to write path to buffer: {}", .{err});
+                    continue :file_loop;
+                };
+                writer.writeAll("\n") catch |err| {
+                    log.err("unable to write to buffer: {}", .{err});
+                    continue :file_loop;
+                };
             }
 
             const string = stream.toOwnedSliceSentinel(0) catch |err| {
