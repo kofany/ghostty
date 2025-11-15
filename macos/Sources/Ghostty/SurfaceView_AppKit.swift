@@ -1953,6 +1953,63 @@ extension Ghostty.SurfaceView {
             content = Ghostty.Shell.escape(url)
         } else if let urls = pb.readObjects(forClasses: [NSURL.self]) as? [URL],
            urls.count > 0 {
+            // Check if this is a single image file that should be uploaded
+            if urls.count == 1,
+               let url = urls.first,
+               Ghostty.ImageUpload.isImageFile(url),
+               let appDelegate = NSApplication.shared.delegate as? AppDelegate,
+               let config = appDelegate.ghostty.config.config {
+                // Try to upload the image asynchronously
+                Task {
+                    if let uploadedURL = await Ghostty.ImageUpload.uploadImage(
+                        filePath: url.path,
+                        config: config
+                    ) {
+                        // Upload succeeded - paste the uploaded URL
+                        DispatchQueue.main.async {
+                            self.insertText(
+                                uploadedURL,
+                                replacementRange: NSMakeRange(0, 0)
+                            )
+                        }
+                    } else {
+                        // Upload failed or not enabled - fall back to pasting file path
+                        var fallback: UnsafePointer<Int8>? = nil
+                        let fallbackKey = "image-upload-fallback"
+                        _ = ghostty_config_get(config, &fallback, fallbackKey, UInt(fallbackKey.count))
+                        let fallbackBehavior = fallback.map { String(cString: $0) } ?? "path"
+                        
+                        switch fallbackBehavior {
+                        case "path":
+                            // Paste the local file path
+                            let escapedPath = Ghostty.Shell.escape(url.path)
+                            DispatchQueue.main.async {
+                                self.insertText(
+                                    escapedPath,
+                                    replacementRange: NSMakeRange(0, 0)
+                                )
+                            }
+                        case "error":
+                            // Show error and paste nothing
+                            Ghostty.logger.error("Image upload failed and fallback is set to error")
+                        case "empty":
+                            // Paste nothing silently
+                            break
+                        default:
+                            // Unknown fallback - use path as default
+                            let escapedPath = Ghostty.Shell.escape(url.path)
+                            DispatchQueue.main.async {
+                                self.insertText(
+                                    escapedPath,
+                                    replacementRange: NSMakeRange(0, 0)
+                                )
+                            }
+                        }
+                    }
+                }
+                return true
+            }
+            
             // File URLs next. They get escaped individually and then joined by a
             // space if there are multiple.
             content = urls

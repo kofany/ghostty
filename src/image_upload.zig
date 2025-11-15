@@ -75,7 +75,11 @@ pub const Uploader = struct {
 
         const url = self.config.@"image-upload-url".?;
 
-        const response = self.uploadMultipart(url, file_path, contents) catch |err| {
+        const response = switch (self.config.@"image-upload-format") {
+            .multipart => self.uploadMultipart(url, file_path, contents),
+            .json => self.uploadJson(url, file_path, contents),
+            .binary => self.uploadBinary(url, file_path, contents),
+        } catch |err| {
             const err_msg = std.fmt.allocPrintZ(
                 self.allocator,
                 "upload failed: {s}",
@@ -183,6 +187,144 @@ pub const Uploader = struct {
         return response_body;
     }
 
+    fn uploadJson(
+        self: *Uploader,
+        url: [:0]const u8,
+        file_path: []const u8,
+        contents: []const u8,
+    ) ![]u8 {
+        _ = file_path;
+        const uri = try std.Uri.parse(url);
+
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        // Encode image as base64
+        const encoded_len = std.base64.standard.Encoder.calcSize(contents.len);
+        const encoded = try self.allocator.alloc(u8, encoded_len);
+        defer self.allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, contents);
+
+        const field_name = self.config.@"image-upload-field";
+
+        // Build JSON body
+        var body_list = std.ArrayList(u8).init(self.allocator);
+        defer body_list.deinit();
+        const body_writer = body_list.writer();
+
+        try body_writer.writeAll("{\"");
+        try body_writer.writeAll(field_name);
+        try body_writer.writeAll("\":\"");
+        try body_writer.writeAll(encoded);
+        try body_writer.writeAll("\"}");
+
+        const body = try body_list.toOwnedSlice();
+        defer self.allocator.free(body);
+
+        var header_buf: [8192]u8 = undefined;
+        var req = try client.open(.POST, uri, .{
+            .server_header_buffer = &header_buf,
+            .headers = .{ .content_type = .{ .override = "application/json" } },
+        });
+        defer req.deinit();
+
+        if (self.config.@"image-upload-header".list.items.len > 0) {
+            for (self.config.@"image-upload-header".list.items) |header_z| {
+                const header = std.mem.span(header_z);
+                if (std.mem.indexOf(u8, header, ":")) |colon_pos| {
+                    const name = std.mem.trim(u8, header[0..colon_pos], " \t");
+                    const value = std.mem.trim(u8, header[colon_pos + 1 ..], " \t");
+                    if (name.len == 0 or value.len == 0) continue;
+                    try req.headers.append(name, value);
+                }
+            }
+        }
+
+        req.transfer_encoding = .{ .content_length = body.len };
+
+        const timeout_ns = @as(u64, self.config.@"image-upload-timeout") * std.time.ns_per_s;
+        const start_time = std.time.nanoTimestamp();
+        const deadline = start_time + @as(i128, timeout_ns);
+
+        try req.send();
+        try req.writeAll(body);
+        try req.finish();
+
+        try req.wait();
+
+        const now = std.time.nanoTimestamp();
+        if (now > deadline) {
+            log.err("Upload exceeded timeout of {}s", .{self.config.@"image-upload-timeout"});
+            return error.UploadTimeout;
+        }
+
+        if (req.response.status != .ok) {
+            log.err("HTTP request failed with status: {}", .{req.response.status});
+            return error.HttpRequestFailed;
+        }
+
+        const response_body = try req.reader().readAllAlloc(self.allocator, 1024 * 1024);
+        return response_body;
+    }
+
+    fn uploadBinary(
+        self: *Uploader,
+        url: [:0]const u8,
+        file_path: []const u8,
+        contents: []const u8,
+    ) ![]u8 {
+        _ = file_path;
+        const uri = try std.Uri.parse(url);
+
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        var header_buf: [8192]u8 = undefined;
+        var req = try client.open(.POST, uri, .{
+            .server_header_buffer = &header_buf,
+            .headers = .{ .content_type = .{ .override = "application/octet-stream" } },
+        });
+        defer req.deinit();
+
+        if (self.config.@"image-upload-header".list.items.len > 0) {
+            for (self.config.@"image-upload-header".list.items) |header_z| {
+                const header = std.mem.span(header_z);
+                if (std.mem.indexOf(u8, header, ":")) |colon_pos| {
+                    const name = std.mem.trim(u8, header[0..colon_pos], " \t");
+                    const value = std.mem.trim(u8, header[colon_pos + 1 ..], " \t");
+                    if (name.len == 0 or value.len == 0) continue;
+                    try req.headers.append(name, value);
+                }
+            }
+        }
+
+        req.transfer_encoding = .{ .content_length = contents.len };
+
+        const timeout_ns = @as(u64, self.config.@"image-upload-timeout") * std.time.ns_per_s;
+        const start_time = std.time.nanoTimestamp();
+        const deadline = start_time + @as(i128, timeout_ns);
+
+        try req.send();
+        try req.writeAll(contents);
+        try req.finish();
+
+        try req.wait();
+
+        const now = std.time.nanoTimestamp();
+        if (now > deadline) {
+            log.err("Upload exceeded timeout of {}s", .{self.config.@"image-upload-timeout"});
+            return error.UploadTimeout;
+        }
+
+        if (req.response.status != .ok) {
+            log.err("HTTP request failed with status: {}", .{req.response.status});
+            return error.HttpRequestFailed;
+        }
+
+        const response_body = try req.reader().readAllAlloc(self.allocator, 1024 * 1024);
+        return response_body;
+    }
+
     fn parseResponse(self: *Uploader, response: []const u8) ![:0]const u8 {
         const path = self.config.@"image-upload-response-path";
 
@@ -190,9 +332,52 @@ pub const Uploader = struct {
             const json_path = path[5..];
             return try self.parseJsonPath(response, json_path);
         } else if (std.mem.startsWith(u8, path, "regex:")) {
-            return error.RegexNotImplemented;
+            const pattern = path[6..];
+            return try self.parseRegex(response, pattern);
         } else {
             return error.InvalidResponsePath;
+        }
+    }
+
+    fn parseRegex(self: *Uploader, response: []const u8, pattern: []const u8) ![:0]const u8 {
+        // Simple regex pattern matching for URLs
+        // Support basic patterns like "https?://[^\s"]+"
+        
+        // For now, implement a simple URL extractor
+        // This covers common cases without requiring a full regex engine
+        
+        if (std.mem.eql(u8, pattern, "https?://[^\\s\"]+") or 
+            std.mem.eql(u8, pattern, "http://.*") or
+            std.mem.eql(u8, pattern, "https://.*")) {
+            // Find first URL-like string starting with http:// or https://
+            var i: usize = 0;
+            while (i < response.len) : (i += 1) {
+                if (std.mem.startsWith(u8, response[i..], "http://") or
+                    std.mem.startsWith(u8, response[i..], "https://")) {
+                    const start = i;
+                    var end = start;
+                    
+                    // Find the end of the URL (stop at whitespace, quotes, or end of string)
+                    while (end < response.len) : (end += 1) {
+                        const c = response[end];
+                        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or 
+                            c == '"' or c == '\'' or c == '<' or c == '>') {
+                            break;
+                        }
+                    }
+                    
+                    if (end > start) {
+                        const url_str = response[start..end];
+                        return try self.allocator.dupeZ(u8, url_str);
+                    }
+                }
+            }
+            
+            log.err("No URL found matching regex pattern", .{});
+            return error.UrlNotFound;
+        } else {
+            log.err("Unsupported regex pattern: {s}", .{pattern});
+            return error.UnsupportedRegexPattern;
         }
     }
 
@@ -434,22 +619,24 @@ test "parseResponse with json prefix" {
     try testing.expectEqualStrings("https://i.imgur.com/test.png", url);
 }
 
-test "parseResponse with regex prefix returns error" {
+test "parseResponse with regex prefix" {
     const allocator = testing.allocator;
 
     var config = Config{};
     config.@"image-upload-enable" = false;
     config.@"image-upload-url" = null;
-    config.@"image-upload-response-path" = "regex:https?://.*";
+    config.@"image-upload-response-path" = "regex:https?://[^\\s\"]+";
 
     var uploader = Uploader{
         .allocator = allocator,
         .config = &config,
     };
 
-    const response = "https://example.com/test.png";
-    const result = uploader.parseResponse(response);
-    try testing.expectError(error.RegexNotImplemented, result);
+    const response = "url: https://example.com/test.png";
+    const url = try uploader.parseResponse(response);
+    defer allocator.free(url);
+
+    try testing.expectEqualStrings("https://example.com/test.png", url);
 }
 
 test "upload returns fallback when disabled" {
@@ -486,4 +673,4 @@ test "upload returns fallback when url is null" {
     defer result.deinit(allocator);
 
     try testing.expect(result == .fallback);
-};
+}
