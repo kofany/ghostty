@@ -623,6 +623,16 @@ extension Ghostty {
             return Scrollbar(rawValue: str) ?? defaultValue
         }
 
+        var commandPaletteEntries: [Ghostty.Command] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_command_list_s = .init()
+            let key = "command-palette-entry"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.commands, count: v.len)
+            return buffer.map { Ghostty.Command(cValue: $0) }
+        }
+
         // MARK: - Image Upload Configuration
 
         var imageUploadEnable: Bool {
