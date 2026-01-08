@@ -1845,10 +1845,20 @@ keybind: Keybinds = .{},
 /// This setting is only supported currently on macOS.
 @"window-vsync": bool = true,
 
-/// If true, new windows and tabs will inherit the working directory of the
+/// If true, new windows will inherit the working directory of the
 /// previously focused window. If no window was previously focused, the default
 /// working directory will be used (the `working-directory` option).
 @"window-inherit-working-directory": bool = true,
+
+/// If true, new tabs will inherit the working directory of the
+/// previously focused tab. If no tab was previously focused, the default
+/// working directory will be used (the `working-directory` option).
+@"tab-inherit-working-directory": bool = true,
+
+/// If true, new split panes will inherit the working directory of the
+/// previously focused split. If no split was previously focused, the default
+/// working directory will be used (the `working-directory` option).
+@"split-inherit-working-directory": bool = true,
 
 /// If true, new windows and tabs will inherit the font size of the previously
 /// focused window. If no window was previously focused, the default font size
@@ -2782,6 +2792,22 @@ keybind: Keybinds = .{},
 ///    When the terminal cursor changes position or color, this is set to
 ///    the same time as the `iTime` uniform, allowing you to compute the
 ///    time since the change by subtracting this from `iTime`.
+///
+///  * `float iTimeFocus` - Timestamp when the surface last gained iFocus.
+///
+///    When the surface gains focus, this is set to the current value of
+///    `iTime`, similar to how `iTimeCursorChange` works. This allows you
+///    to compute the time since focus was gained or lost by calculating
+///    `iTime - iTimeFocus`. Use this to create animations that restart
+///    when the terminal regains focus.
+///
+///  * `int iFocus` - Current focus state of the surface.
+///
+///    Set to 1.0 when the surface is focused, 0.0 when unfocused. This
+///    allows shaders to detect unfocused state and avoid animation artifacts
+///    from large time deltas caused by infrequent "deceptive frames"
+///    (e.g., modifier key presses, link hover events in unfocused split panes).
+///    Check `iFocus > 0` to determine if the surface is currently focused.
 ///
 /// If the shader fails to compile, the shader will be ignored. Any errors
 /// related to shader compilation will not show up as configuration errors
@@ -6481,6 +6507,12 @@ pub const Keybinds = struct {
                 .{ .key = .{ .physical = .page_down }, .mods = .{ .super = true } },
                 .{ .scroll_page_down = {} },
             );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'j' }, .mods = .{ .super = true } },
+                .{ .scroll_to_selection = {} },
+                .{ .performable = true },
+            );
 
             // Semantic prompts
             try self.set.put(
@@ -6618,6 +6650,12 @@ pub const Keybinds = struct {
                 alloc,
                 .{ .key = .{ .unicode = 'f' }, .mods = .{ .super = true } },
                 .start_search,
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'e' }, .mods = .{ .super = true } },
+                .search_selection,
                 .{ .performable = true },
             );
             try self.set.putFlags(
