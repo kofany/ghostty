@@ -49,7 +49,12 @@ const Node = struct {
 /// The memory pool we get page nodes from.
 const NodePool = std.heap.MemoryPool(List.Node);
 
+/// The standard page capacity that we use as a starting point for
+/// all pages. This is chosen as a sane default that fits most terminal
+/// usage to support using our pool.
 const std_capacity = pagepkg.std_capacity;
+
+/// The byte size required for a standard page.
 const std_size = Page.layout(std_capacity).total_size;
 
 /// The memory pool we use for page memory buffers. We use a separate pool
@@ -109,7 +114,6 @@ pub const MemoryPool = struct {
 
 /// The memory pool we get page nodes, pages from.
 pool: MemoryPool,
-pool_owned: bool,
 
 /// The list of pages in the screen.
 pages: List,
@@ -224,19 +228,30 @@ pub const Viewport = union(enum) {
 /// But this gives us a nice fast heuristic for determining min/max size.
 /// Therefore, if the page size is violated you should always also verify
 /// that we have enough space for the active area.
-fn minMaxSize(cols: size.CellCountInt, rows: size.CellCountInt) !usize {
+fn minMaxSize(cols: size.CellCountInt, rows: size.CellCountInt) usize {
+    // Invariant required to ensure our divCeil below cannot overflow.
+    comptime {
+        const max_rows = std.math.maxInt(size.CellCountInt);
+        _ = std.math.divCeil(usize, max_rows, 1) catch unreachable;
+    }
+
     // Get our capacity to fit our rows. If the cols are too big, it may
     // force less rows than we want meaning we need more than one page to
     // represent a viewport.
-    const cap = try std_capacity.adjust(.{ .cols = cols });
+    const cap = initialCapacity(cols);
 
     // Calculate the number of standard sized pages we need to represent
     // an active area.
-    const pages_exact = if (cap.rows >= rows) 1 else try std.math.divCeil(
+    const pages_exact = if (cap.rows >= rows) 1 else std.math.divCeil(
         usize,
         rows,
         cap.rows,
-    );
+    ) catch {
+        // Not possible:
+        // - initialCapacity guarantees at least 1 row
+        // - numerator/denominator can't overflow because of comptime check above
+        unreachable;
+    };
 
     // We always need at least one page extra so that we
     // can fit partial pages to spread our active area across two pages.
@@ -254,6 +269,49 @@ fn minMaxSize(cols: size.CellCountInt, rows: size.CellCountInt) !usize {
     // });
 
     return PagePool.item_size * pages;
+}
+
+/// Calculates the initial capacity for a new page for a given column
+/// count. This will attempt to fit within std_size at all times so we
+/// can use our memory pool, but if cols is too big, this will return a
+/// larger capacity.
+///
+/// The returned capacity is always guaranteed to layout properly (not
+/// overflow). We are able to support capacities up to the maximum int
+/// value of cols, so this will never overflow.
+fn initialCapacity(cols: size.CellCountInt) Capacity {
+    // This is an important invariant that ensures that this function
+    // can never return an error. We verify here that our standard capacity
+    // when increased to maximum possible columns can always support at
+    // least one row in memory.
+    //
+    // IF THIS EVER FAILS: We probably need to modify our logic below
+    // to reduce other elements of the capacity (styles, graphemes, etc.).
+    // But, instead, I recommend taking a step back and re-evaluating
+    // life choices.
+    comptime {
+        var cap = std_capacity;
+        cap.cols = std.math.maxInt(size.CellCountInt);
+        _ = Page.layout(cap);
+    }
+
+    if (std_capacity.adjust(
+        .{ .cols = cols },
+    )) |cap| {
+        // If we can adjust our standard capacity, we fit within the
+        // standard size and we're good!
+        return cap;
+    } else |err| {
+        // Ensure our error set doesn't change.
+        comptime assert(@TypeOf(err) == error{OutOfMemory});
+    }
+
+    // This code path means that our standard capacity can't even
+    // accommodate our column count! The only solution is to increase
+    // our capacity and go non-standard.
+    var cap: Capacity = std_capacity;
+    cap.cols = cols;
+    return cap;
 }
 
 /// This is the page allocator we'll use for all our underlying
@@ -311,7 +369,7 @@ pub fn init(
     );
 
     // Get our minimum max size, see doc comments for more details.
-    const min_max_size = try minMaxSize(cols, rows);
+    const min_max_size = minMaxSize(cols, rows);
 
     // We always track our viewport pin to ensure this is never an allocation
     const viewport_pin = try pool.pins.create();
@@ -324,7 +382,6 @@ pub fn init(
         .cols = cols,
         .rows = rows,
         .pool = pool,
-        .pool_owned = true,
         .pages = page_list,
         .page_serial = page_serial,
         .page_serial_min = 0,
@@ -346,17 +403,31 @@ fn initPages(
     serial: *u64,
     cols: size.CellCountInt,
     rows: size.CellCountInt,
-) !struct { List, usize } {
+) Allocator.Error!struct { List, usize } {
     var page_list: List = .{};
     var page_size: usize = 0;
 
     // Add pages as needed to create our initial viewport.
-    const cap = try std_capacity.adjust(.{ .cols = cols });
+    const cap = initialCapacity(cols);
+    const layout = Page.layout(cap);
+    const pooled = layout.total_size <= std_size;
+    const page_alloc = pool.pages.arena.child_allocator;
+
     var rem = rows;
     while (rem > 0) {
         const node = try pool.nodes.create();
-        const page_buf = try pool.pages.create();
-        // no errdefer because the pool deinit will clean these up
+        const page_buf = if (pooled)
+            try pool.pages.create()
+        else
+            try page_alloc.alignedAlloc(
+                u8,
+                .fromByteUnits(std.heap.page_size_min),
+                layout.total_size,
+            );
+        errdefer if (pooled)
+            pool.pages.destroy(page_buf)
+        else
+            page_alloc.free(page_buf);
 
         // In runtime safety modes we have to memset because the Zig allocator
         // interface will always memset to 0xAA for undefined. In non-safe modes
@@ -366,10 +437,7 @@ fn initPages(
         // Initialize the first set of pages to contain our viewport so that
         // the top of the first page is always the active area.
         node.* = .{
-            .data = .initBuf(
-                .init(page_buf),
-                Page.layout(cap),
-            ),
+            .data = .initBuf(.init(page_buf), layout),
             .serial = serial.*,
         };
         node.data.size.rows = @min(rem, node.data.capacity.rows);
@@ -519,11 +587,7 @@ pub fn deinit(self: *PageList) void {
 
     // Deallocate all the pages. We don't need to deallocate the list or
     // nodes because they all reside in the pool.
-    if (self.pool_owned) {
-        self.pool.deinit();
-    } else {
-        self.pool.reset(.{ .retain_capacity = {} });
-    }
+    self.pool.deinit();
 }
 
 /// Reset the PageList back to an empty state. This is similar to
@@ -539,10 +603,8 @@ pub fn reset(self: *PageList) void {
     // We need enough pages/nodes to keep our active area. This should
     // never fail since we by definition have allocated a page already
     // that fits our size but I'm not confident to make that assertion.
-    const cap = std_capacity.adjust(
-        .{ .cols = self.cols },
-    ) catch @panic("reset: std_capacity.adjust failed");
-    assert(cap.rows > 0); // adjust should never return 0 rows
+    const cap = initialCapacity(self.cols);
+    assert(cap.rows > 0);
 
     // The number of pages we need is the number of rows in the active
     // area divided by the row capacity of a page.
@@ -641,14 +703,6 @@ pub const Clone = struct {
     top: point.Point,
     bot: ?point.Point = null,
 
-    /// The allocator source for the clone operation. If this is alloc
-    /// then the cloned pagelist will own and dealloc the memory on deinit.
-    /// If this is pool then the caller owns the memory.
-    memory: union(enum) {
-        alloc: Allocator,
-        pool: *MemoryPool,
-    },
-
     // If this is non-null then cloning will attempt to remap the tracked
     // pins into the new cloned area and will keep track of the old to
     // new mapping in this map. If this is null, the cloned pagelist will
@@ -670,37 +724,26 @@ pub const Clone = struct {
 /// rows will be added to the bottom of the region to make up the difference.
 pub fn clone(
     self: *const PageList,
+    alloc: Allocator,
     opts: Clone,
 ) !PageList {
     var it = self.pageIterator(.right_down, opts.top, opts.bot);
 
-    // Setup our own memory pool if we have to.
-    var owned_pool: ?MemoryPool = switch (opts.memory) {
-        .pool => null,
-        .alloc => |alloc| alloc: {
-            // First, count our pages so our preheat is exactly what we need.
-            var it_copy = it;
-            const page_count: usize = page_count: {
-                var count: usize = 0;
-                while (it_copy.next()) |_| count += 1;
-                break :page_count count;
-            };
-
-            // Setup our pools
-            break :alloc try .init(
-                alloc,
-                pageAllocator(),
-                page_count,
-            );
-        },
+    // First, count our pages so our preheat is exactly what we need.
+    var it_copy = it;
+    const page_count: usize = page_count: {
+        var count: usize = 0;
+        while (it_copy.next()) |_| count += 1;
+        break :page_count count;
     };
-    errdefer if (owned_pool) |*pool| pool.deinit();
 
-    // Create our memory pool we use
-    const pool: *MemoryPool = switch (opts.memory) {
-        .pool => |v| v,
-        .alloc => &owned_pool.?,
-    };
+    // Setup our pool
+    var pool: MemoryPool = try .init(
+        alloc,
+        pageAllocator(),
+        page_count,
+    );
+    errdefer pool.deinit();
 
     // Our viewport pin is always undefined since our viewport in a clones
     // goes back to the top
@@ -729,7 +772,7 @@ pub fn clone(
         // Clone the page. We have to use createPageExt here because
         // we don't know if the source page has a standard size.
         const node = try createPageExt(
-            pool,
+            &pool,
             chunk.node.data.capacity,
             &page_serial,
             &page_size,
@@ -770,11 +813,7 @@ pub fn clone(
     }
 
     var result: PageList = .{
-        .pool = pool.*,
-        .pool_owned = switch (opts.memory) {
-            .pool => false,
-            .alloc => true,
-        },
+        .pool = pool,
         .pages = page_list,
         .page_serial = page_serial,
         .page_serial_min = 0,
@@ -857,7 +896,7 @@ pub fn resize(self: *PageList, opts: Resize) !void {
     // when increasing beyond our initial minimum max size or explicit max
     // size to fit the active area.
     const old_min_max_size = self.min_max_size;
-    self.min_max_size = try minMaxSize(
+    self.min_max_size = minMaxSize(
         opts.cols orelse self.cols,
         opts.rows orelse self.rows,
     );
@@ -1621,7 +1660,7 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) !void {
     // We only set the new min_max_size if we're not reflowing. If we are
     // reflowing, then resize handles this for us.
     const old_min_max_size = self.min_max_size;
-    self.min_max_size = if (!opts.reflow) try minMaxSize(
+    self.min_max_size = if (!opts.reflow) minMaxSize(
         opts.cols orelse self.cols,
         opts.rows orelse self.rows,
     ) else old_min_max_size;
@@ -2538,6 +2577,18 @@ pub fn grow(self: *PageList) !?*List.Node {
             }
         }
 
+        // Update any tracked pins that point to this page to point to the
+        // new first page to the top-left, and mark them as garbage.
+        const pin_keys = self.tracked_pins.keys();
+        for (pin_keys) |p| {
+            if (p.node != first) continue;
+            p.node = self.pages.first.?;
+            p.y = 0;
+            p.x = 0;
+            p.garbage = true;
+        }
+        self.viewport_pin.garbage = false;
+
         // If our first node has non-standard memory size, we can't reuse
         // it. This is because our initBuf below would change the underlying
         // memory length which would break our memory free outside the pool.
@@ -2566,18 +2617,6 @@ pub fn grow(self: *PageList) !?*List.Node {
         self.page_serial_min = first.serial + 1;
         first.serial = self.page_serial;
         self.page_serial += 1;
-
-        // Update any tracked pins that point to this page to point to the
-        // new first page to the top-left.
-        const pin_keys = self.tracked_pins.keys();
-        for (pin_keys) |p| {
-            if (p.node != first) continue;
-            p.node = self.pages.first.?;
-            p.y = 0;
-            p.x = 0;
-            p.garbage = true;
-        }
-        self.viewport_pin.garbage = false;
 
         // In this case we do NOT need to update page_size because
         // we're reusing an existing page so nothing has changed.
@@ -4568,6 +4607,38 @@ test "PageList init rows across two pages" {
     try testing.expect(s.viewport == .active);
     try testing.expect(s.pages.first != null);
     try testing.expectEqual(@as(usize, s.rows), s.totalRows());
+
+    // Initial total rows should be our row count
+    try testing.expectEqual(s.rows, s.total_rows);
+
+    // Scrollbar should be where we expect it
+    try testing.expectEqual(Scrollbar{
+        .total = s.rows,
+        .offset = 0,
+        .len = s.rows,
+    }, s.scrollbar());
+}
+
+test "PageList init more than max cols" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Initialize with more columns than we can fit in our standard
+    // capacity. This is going to force us to go to a non-standard page
+    // immediately.
+    var s = try init(
+        alloc,
+        std_capacity.maxCols().? + 1,
+        80,
+        null,
+    );
+    defer s.deinit();
+    try testing.expect(s.viewport == .active);
+    try testing.expectEqual(@as(usize, s.rows), s.totalRows());
+
+    // We expect a single, non-standard page
+    try testing.expect(s.pages.first != null);
+    try testing.expect(s.pages.first.?.data.memory.len > std_size);
 
     // Initial total rows should be our row count
     try testing.expectEqual(s.rows, s.total_rows);
@@ -7141,9 +7212,8 @@ test "PageList clone" {
     defer s.deinit();
     try testing.expectEqual(@as(usize, s.rows), s.totalRows());
 
-    var s2 = try s.clone(.{
+    var s2 = try s.clone(alloc, .{
         .top = .{ .screen = .{} },
-        .memory = .{ .alloc = alloc },
     });
     defer s2.deinit();
     try testing.expectEqual(@as(usize, s.rows), s2.totalRows());
@@ -7158,10 +7228,9 @@ test "PageList clone partial trimmed right" {
     try testing.expectEqual(@as(usize, s.rows), s.totalRows());
     try s.growRows(30);
 
-    var s2 = try s.clone(.{
+    var s2 = try s.clone(alloc, .{
         .top = .{ .screen = .{} },
         .bot = .{ .screen = .{ .y = 39 } },
-        .memory = .{ .alloc = alloc },
     });
     defer s2.deinit();
     try testing.expectEqual(@as(usize, 40), s2.totalRows());
@@ -7176,9 +7245,8 @@ test "PageList clone partial trimmed left" {
     try testing.expectEqual(@as(usize, s.rows), s.totalRows());
     try s.growRows(30);
 
-    var s2 = try s.clone(.{
+    var s2 = try s.clone(alloc, .{
         .top = .{ .screen = .{ .y = 10 } },
-        .memory = .{ .alloc = alloc },
     });
     defer s2.deinit();
     try testing.expectEqual(@as(usize, 40), s2.totalRows());
@@ -7220,9 +7288,8 @@ test "PageList clone partial trimmed left reclaims styles" {
         try testing.expectEqual(1, page.styles.count());
     }
 
-    var s2 = try s.clone(.{
+    var s2 = try s.clone(alloc, .{
         .top = .{ .screen = .{ .y = 10 } },
-        .memory = .{ .alloc = alloc },
     });
     defer s2.deinit();
     try testing.expectEqual(@as(usize, 40), s2.totalRows());
@@ -7243,10 +7310,9 @@ test "PageList clone partial trimmed both" {
     try testing.expectEqual(@as(usize, s.rows), s.totalRows());
     try s.growRows(30);
 
-    var s2 = try s.clone(.{
+    var s2 = try s.clone(alloc, .{
         .top = .{ .screen = .{ .y = 10 } },
         .bot = .{ .screen = .{ .y = 35 } },
-        .memory = .{ .alloc = alloc },
     });
     defer s2.deinit();
     try testing.expectEqual(@as(usize, 26), s2.totalRows());
@@ -7260,9 +7326,8 @@ test "PageList clone less than active" {
     defer s.deinit();
     try testing.expectEqual(@as(usize, s.rows), s.totalRows());
 
-    var s2 = try s.clone(.{
+    var s2 = try s.clone(alloc, .{
         .top = .{ .active = .{ .y = 5 } },
-        .memory = .{ .alloc = alloc },
     });
     defer s2.deinit();
     try testing.expectEqual(@as(usize, s.rows), s2.totalRows());
@@ -7282,9 +7347,8 @@ test "PageList clone remap tracked pin" {
 
     var pin_remap = Clone.TrackedPinsRemap.init(alloc);
     defer pin_remap.deinit();
-    var s2 = try s.clone(.{
+    var s2 = try s.clone(alloc, .{
         .top = .{ .active = .{ .y = 5 } },
-        .memory = .{ .alloc = alloc },
         .tracked_pins = &pin_remap,
     });
     defer s2.deinit();
@@ -7311,9 +7375,8 @@ test "PageList clone remap tracked pin not in cloned area" {
 
     var pin_remap = Clone.TrackedPinsRemap.init(alloc);
     defer pin_remap.deinit();
-    var s2 = try s.clone(.{
+    var s2 = try s.clone(alloc, .{
         .top = .{ .active = .{ .y = 5 } },
-        .memory = .{ .alloc = alloc },
         .tracked_pins = &pin_remap,
     });
     defer s2.deinit();
@@ -7335,9 +7398,8 @@ test "PageList clone full dirty" {
     s.markDirty(.{ .active = .{ .x = 0, .y = 12 } });
     s.markDirty(.{ .active = .{ .x = 0, .y = 23 } });
 
-    var s2 = try s.clone(.{
+    var s2 = try s.clone(alloc, .{
         .top = .{ .screen = .{} },
-        .memory = .{ .alloc = alloc },
     });
     defer s2.deinit();
     try testing.expectEqual(@as(usize, s.rows), s2.totalRows());
@@ -11068,6 +11130,10 @@ test "PageList grow reuses non-standard page without leak" {
     const first_page_ptr = s.pages.first.?;
     const first_page_mem_ptr = s.pages.first.?.data.memory.ptr;
 
+    // Create a tracked pin pointing to the non-standard first page
+    const tracked_pin = try s.trackPin(.{ .node = first_page_ptr, .x = 0, .y = 0 });
+    defer s.untrackPin(tracked_pin);
+
     // Now grow one more time to trigger the reuse path. Since the first page
     // is non-standard, it should be destroyed (not reused). The testing
     // allocator will detect a leak if destroyNode doesn't properly free
@@ -11082,4 +11148,10 @@ test "PageList grow reuses non-standard page without leak" {
     // If the non-standard page was properly destroyed and not reused,
     // the last page should not have the same memory pointer
     try testing.expect(s.pages.last.?.data.memory.ptr != first_page_mem_ptr);
+
+    // The tracked pin should have been moved to the new first page and marked as garbage
+    try testing.expectEqual(s.pages.first.?, tracked_pin.node);
+    try testing.expectEqual(0, tracked_pin.x);
+    try testing.expectEqual(0, tracked_pin.y);
+    try testing.expect(tracked_pin.garbage);
 }
