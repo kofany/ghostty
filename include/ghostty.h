@@ -66,6 +66,14 @@ typedef enum {
   GHOSTTY_MOUSE_LEFT,
   GHOSTTY_MOUSE_RIGHT,
   GHOSTTY_MOUSE_MIDDLE,
+  GHOSTTY_MOUSE_FOUR,
+  GHOSTTY_MOUSE_FIVE,
+  GHOSTTY_MOUSE_SIX,
+  GHOSTTY_MOUSE_SEVEN,
+  GHOSTTY_MOUSE_EIGHT,
+  GHOSTTY_MOUSE_NINE,
+  GHOSTTY_MOUSE_TEN,
+  GHOSTTY_MOUSE_ELEVEN,
 } ghostty_input_mouse_button_e;
 
 typedef enum {
@@ -1016,6 +1024,7 @@ ghostty_config_t ghostty_config_new();
 void ghostty_config_free(ghostty_config_t);
 ghostty_config_t ghostty_config_clone(ghostty_config_t);
 void ghostty_config_load_cli_args(ghostty_config_t);
+void ghostty_config_load_file(ghostty_config_t, const char*);
 void ghostty_config_load_default_files(ghostty_config_t);
 void ghostty_config_load_recursive_files(ghostty_config_t);
 void ghostty_config_finalize(ghostty_config_t);

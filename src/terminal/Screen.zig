@@ -1789,9 +1789,25 @@ fn resizeInternal(
 
 /// Set a style attribute for the current cursor.
 ///
-/// This can cause a page split if the current page cannot fit this style.
-/// This is the only scenario an error return is possible.
-pub fn setAttribute(self: *Screen, attr: sgr.Attribute) !void {
+/// If the style can't be set due to any internal errors (memory-related),
+/// then this will revert back to the existing style and return an error.
+pub fn setAttribute(
+    self: *Screen,
+    attr: sgr.Attribute,
+) PageList.IncreaseCapacityError!void {
+    // If we fail to set our style for any reason, we should revert
+    // back to the old style. If we fail to do that, we revert back to
+    // the default style.
+    const old_style = self.cursor.style;
+    errdefer {
+        self.cursor.style = old_style;
+        self.manualStyleUpdate() catch |err| {
+            log.warn("setAttribute error restoring old style after failure err={}", .{err});
+            self.cursor.style = .{};
+            self.manualStyleUpdate() catch unreachable;
+        };
+    }
+
     switch (attr) {
         .unset => {
             self.cursor.style = .{};
@@ -1935,14 +1951,18 @@ pub fn setAttribute(self: *Screen, attr: sgr.Attribute) !void {
 
 /// Call this whenever you manually change the cursor style.
 ///
-/// Note that this can return any PageList capacity error, because it
-/// is possible for the internal pagelist to not accommodate the new style
-/// at all. This WILL attempt to resize our internal pages to fit the style
-/// but it is possible that it cannot be done, in which case upstream callers
-/// need to split the page or do something else.
+/// This function can NOT fail if the cursor style is changing to the
+/// default style.
 ///
-/// NOTE(mitchellh): I think in the future we'll do page splitting
-/// automatically here and remove this failure scenario.
+/// If this returns an error, the style change did not take effect and
+/// the cursor style is reverted back to the default. The only scenario
+/// this returns an error is if there is a physical memory allocation failure
+/// or if there is no possible way to increase style capacity to store
+/// the style.
+///
+/// This function WILL split pages as necessary to accommodate the new style.
+/// So if OutOfSpace is returned, it means that even after splitting the page
+/// there was still no room for the new style.
 pub fn manualStyleUpdate(self: *Screen) PageList.IncreaseCapacityError!void {
     defer self.assertIntegrity();
     var page: *Page = &self.cursor.page_pin.node.data;
@@ -1979,13 +1999,22 @@ pub fn manualStyleUpdate(self: *Screen) PageList.IncreaseCapacityError!void {
     ) catch |err| id: {
         // Our style map is full or needs to be rehashed, so we need to
         // increase style capacity (or rehash).
-        const node = try self.increaseCapacity(
+        const node = self.increaseCapacity(
             self.cursor.page_pin.node,
             switch (err) {
                 error.OutOfMemory => .styles,
                 error.NeedsRehash => null,
             },
-        );
+        ) catch |increase_err| switch (increase_err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfSpace => space: {
+                // Out of space, we need to split the page. Split wherever
+                // is using less capacity and hope that works. If it doesn't
+                // work, we tried.
+                try self.splitForCapacity(self.cursor.page_pin.*);
+                break :space self.cursor.page_pin.node;
+            },
+        };
 
         page = &node.data;
         break :id page.styles.add(
@@ -2013,6 +2042,62 @@ pub fn manualStyleUpdate(self: *Screen) PageList.IncreaseCapacityError!void {
     errdefer page.styles.release(page.memory, id);
 
     self.cursor.style_id = id;
+}
+
+/// Split at the given pin so that the pinned row moves to the page
+/// with less used capacity after the split.
+///
+/// The primary use case for this is to handle IncreaseCapacityError
+/// OutOfSpace conditions where we need to split the page in order
+/// to make room for more managed memory.
+///
+/// If the caller cares about where the pin moves to, they should
+/// setup a tracked pin before calling this and then check that.
+/// In many calling cases, the input pin is tracked (e.g. the cursor
+/// pin).
+///
+/// If this returns OOM then its a system OOM. If this returns OutOfSpace
+/// then it means the page can't be split further.
+fn splitForCapacity(
+    self: *Screen,
+    pin: Pin,
+) PageList.SplitError!void {
+    // Get our capacities. We include our target row because its
+    // capacity will be preserved.
+    const bytes_above = Page.layout(pin.node.data.exactRowCapacity(
+        0,
+        pin.y + 1,
+    )).total_size;
+    const bytes_below = Page.layout(pin.node.data.exactRowCapacity(
+        pin.y,
+        pin.node.data.size.rows,
+    )).total_size;
+
+    // We need to track the old cursor pin because if our split
+    // moves the cursor pin we need to update our accounting.
+    const old_cursor = self.cursor.page_pin.*;
+
+    // If our bytes above are less than bytes below, we move the pin
+    // to split down one since splitting includes the pinned row in
+    // the new node.
+    try self.pages.split(if (bytes_above < bytes_below)
+        pin.down(1) orelse pin
+    else
+        pin);
+
+    // Cursor didn't change nodes, we're done.
+    if (self.cursor.page_pin.node == old_cursor.node) return;
+
+    // Cursor changed, we need to restore the old pin then use
+    // cursorChangePin to move to the new pin. The old node is guaranteed
+    // to still exist, just not the row.
+    //
+    // Note that page_row and all that will be invalid, it points to the
+    // new node, but at the time of writing this we don't need any of that
+    // to be right in cursorChangePin.
+    const new_cursor = self.cursor.page_pin.*;
+    self.cursor.page_pin.* = old_cursor;
+    self.cursorChangePin(new_cursor);
 }
 
 /// Append a grapheme to the given cell within the current cursor row.
@@ -2532,11 +2617,15 @@ pub fn selectAll(self: *Screen) ?Selection {
 /// end_pt (inclusive). Because it selects "nearest" to start point, start
 /// point can be before or after end point.
 ///
+/// The boundary_codepoints parameter should be a slice of u21 codepoints that
+/// mark word boundaries, passed through to selectWord.
+///
 /// TODO: test this
 pub fn selectWordBetween(
     self: *Screen,
     start: Pin,
     end: Pin,
+    boundary_codepoints: []const u21,
 ) ?Selection {
     const dir: PageList.Direction = if (start.before(end)) .right_down else .left_up;
     var it = start.cellIterator(dir, end);
@@ -2548,7 +2637,7 @@ pub fn selectWordBetween(
         }
 
         // If we found a word, then return it
-        if (self.selectWord(pin)) |sel| return sel;
+        if (self.selectWord(pin, boundary_codepoints)) |sel| return sel;
     }
 
     return null;
@@ -2560,32 +2649,15 @@ pub fn selectWordBetween(
 ///
 /// This will return null if a selection is impossible. The only scenario
 /// this happens is if the point pt is outside of the written screen space.
-pub fn selectWord(self: *Screen, pin: Pin) ?Selection {
+///
+/// The boundary_codepoints parameter should be a slice of u21 codepoints that
+/// mark word boundaries. This is expected to be pre-parsed from the config.
+pub fn selectWord(
+    self: *Screen,
+    pin: Pin,
+    boundary_codepoints: []const u21,
+) ?Selection {
     _ = self;
-
-    // Boundary characters for selection purposes
-    const boundary = &[_]u32{
-        0,
-        ' ',
-        '\t',
-        '\'',
-        '"',
-        '│',
-        '`',
-        '|',
-        ':',
-        ';',
-        ',',
-        '(',
-        ')',
-        '[',
-        ']',
-        '{',
-        '}',
-        '<',
-        '>',
-        '$',
-    };
 
     // If our cell is empty we can't select a word, because we can't select
     // areas where the screen is not yet written.
@@ -2594,9 +2666,9 @@ pub fn selectWord(self: *Screen, pin: Pin) ?Selection {
 
     // Determine if we are a boundary or not to determine what our boundary is.
     const expect_boundary = std.mem.indexOfAny(
-        u32,
-        boundary,
-        &[_]u32{start_cell.content.codepoint},
+        u21,
+        boundary_codepoints,
+        &[_]u21{start_cell.content.codepoint},
     ) != null;
 
     // Go forwards to find our end boundary
@@ -2612,9 +2684,9 @@ pub fn selectWord(self: *Screen, pin: Pin) ?Selection {
 
             // If we do not match our expected set, we hit a boundary
             const this_boundary = std.mem.indexOfAny(
-                u32,
-                boundary,
-                &[_]u32{cell.content.codepoint},
+                u21,
+                boundary_codepoints,
+                &[_]u21{cell.content.codepoint},
             ) != null;
             if (this_boundary != expect_boundary) break :end prev;
 
@@ -2649,9 +2721,9 @@ pub fn selectWord(self: *Screen, pin: Pin) ?Selection {
 
             // If we do not match our expected set, we hit a boundary
             const this_boundary = std.mem.indexOfAny(
-                u32,
-                boundary,
-                &[_]u32{cell.content.codepoint},
+                u21,
+                boundary_codepoints,
+                &[_]u21{cell.content.codepoint},
             ) != null;
             if (this_boundary != expect_boundary) break :start prev;
 
@@ -7614,6 +7686,12 @@ test "Screen: selectWord" {
     defer s.deinit();
     try s.testWriteString("ABC  DEF\n 123\n456");
 
+    // Default boundary codepoints for word selection
+    const boundary_codepoints = &[_]u21{
+        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
+        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+    };
+
     // Outside of active area
     // try testing.expect(s.selectWord(.{ .x = 9, .y = 0 }) == null);
     // try testing.expect(s.selectWord(.{ .x = 0, .y = 5 }) == null);
@@ -7623,7 +7701,7 @@ test "Screen: selectWord" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 0,
             .y = 0,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 0,
@@ -7640,7 +7718,7 @@ test "Screen: selectWord" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 2,
             .y = 0,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 0,
@@ -7657,7 +7735,7 @@ test "Screen: selectWord" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 1,
             .y = 0,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 0,
@@ -7674,7 +7752,7 @@ test "Screen: selectWord" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 3,
             .y = 0,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 3,
@@ -7691,7 +7769,7 @@ test "Screen: selectWord" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 0,
             .y = 1,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 0,
@@ -7708,7 +7786,7 @@ test "Screen: selectWord" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 1,
             .y = 2,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 0,
@@ -7729,6 +7807,12 @@ test "Screen: selectWord across soft-wrap" {
     defer s.deinit();
     try s.testWriteString(" 1234012\n 123");
 
+    // Default boundary codepoints for word selection
+    const boundary_codepoints = &[_]u21{
+        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
+        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+    };
+
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -7740,7 +7824,7 @@ test "Screen: selectWord across soft-wrap" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 1,
             .y = 0,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 1,
@@ -7757,7 +7841,7 @@ test "Screen: selectWord across soft-wrap" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 1,
             .y = 1,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 1,
@@ -7774,7 +7858,7 @@ test "Screen: selectWord across soft-wrap" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 3,
             .y = 0,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 1,
@@ -7795,12 +7879,18 @@ test "Screen: selectWord whitespace across soft-wrap" {
     defer s.deinit();
     try s.testWriteString("1       1\n 123");
 
+    // Default boundary codepoints for word selection
+    const boundary_codepoints = &[_]u21{
+        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
+        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+    };
+
     // Going forward
     {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 1,
             .y = 0,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 1,
@@ -7817,7 +7907,7 @@ test "Screen: selectWord whitespace across soft-wrap" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 1,
             .y = 1,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 1,
@@ -7834,7 +7924,7 @@ test "Screen: selectWord whitespace across soft-wrap" {
         var sel = s.selectWord(s.pages.pin(.{ .active = .{
             .x = 3,
             .y = 0,
-        } }).?).?;
+        } }).?, boundary_codepoints).?;
         defer sel.deinit(&s);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 1,
@@ -7850,6 +7940,12 @@ test "Screen: selectWord whitespace across soft-wrap" {
 test "Screen: selectWord with character boundary" {
     const testing = std.testing;
     const alloc = testing.allocator;
+
+    // Default boundary codepoints for word selection
+    const boundary_codepoints = &[_]u21{
+        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
+        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+    };
 
     const cases = [_][]const u8{
         " 'abc' \n123",
@@ -7881,7 +7977,7 @@ test "Screen: selectWord with character boundary" {
             var sel = s.selectWord(s.pages.pin(.{ .active = .{
                 .x = 2,
                 .y = 0,
-            } }).?).?;
+            } }).?, boundary_codepoints).?;
             defer sel.deinit(&s);
             try testing.expectEqual(point.Point{ .screen = .{
                 .x = 2,
@@ -7898,7 +7994,7 @@ test "Screen: selectWord with character boundary" {
             var sel = s.selectWord(s.pages.pin(.{ .active = .{
                 .x = 4,
                 .y = 0,
-            } }).?).?;
+            } }).?, boundary_codepoints).?;
             defer sel.deinit(&s);
             try testing.expectEqual(point.Point{ .screen = .{
                 .x = 2,
@@ -7915,7 +8011,7 @@ test "Screen: selectWord with character boundary" {
             var sel = s.selectWord(s.pages.pin(.{ .active = .{
                 .x = 3,
                 .y = 0,
-            } }).?).?;
+            } }).?, boundary_codepoints).?;
             defer sel.deinit(&s);
             try testing.expectEqual(point.Point{ .screen = .{
                 .x = 2,
@@ -7934,7 +8030,7 @@ test "Screen: selectWord with character boundary" {
             var sel = s.selectWord(s.pages.pin(.{ .active = .{
                 .x = 1,
                 .y = 0,
-            } }).?).?;
+            } }).?, boundary_codepoints).?;
             defer sel.deinit(&s);
             try testing.expectEqual(point.Point{ .screen = .{
                 .x = 0,
@@ -9246,4 +9342,125 @@ test "Screen: cursorDown to page with insufficient capacity" {
         // Didn't find boundary
         try testing.expect(false);
     }
+}
+
+test "Screen setAttribute increases capacity when style map is full" {
+    // Tests that setAttribute succeeds when the style map is full by
+    // increasing page capacity. When capacity is at max and increaseCapacity
+    // returns OutOfSpace, manualStyleUpdate will split the page instead.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Use a small screen with multiple rows
+    var s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 10 });
+    defer s.deinit();
+
+    // Write content to multiple rows
+    try s.testWriteString("line1\nline2\nline3\nline4\nline5");
+
+    // Get the page and fill its style map to capacity
+    const page = &s.cursor.page_pin.node.data;
+    const original_styles_capacity = page.capacity.styles;
+
+    // Fill the style map to capacity using the StyleSet's layout capacity
+    // which accounts for the load factor
+    {
+        page.pauseIntegrityChecks(true);
+        defer page.pauseIntegrityChecks(false);
+        defer page.assertIntegrity();
+
+        const max_items = page.styles.layout.cap;
+        var n: usize = 1;
+        while (n < max_items) : (n += 1) {
+            _ = page.styles.add(
+                page.memory,
+                .{ .bg_color = .{ .rgb = @bitCast(@as(u24, @intCast(n))) } },
+            ) catch break;
+        }
+    }
+
+    // Now try to set a new unique attribute that would require a new style slot
+    // This should succeed by increasing capacity (or splitting if at max capacity)
+    try s.setAttribute(.bold);
+
+    // The style should have been applied (bold flag set)
+    try testing.expect(s.cursor.style.flags.bold);
+
+    // The cursor should have a valid non-default style_id
+    try testing.expect(s.cursor.style_id != style.default_id);
+
+    // Either the capacity increased or the page was split/changed
+    const current_page = &s.cursor.page_pin.node.data;
+    const capacity_increased = current_page.capacity.styles > original_styles_capacity;
+    const page_changed = current_page != page;
+    try testing.expect(capacity_increased or page_changed);
+}
+
+test "Screen setAttribute splits page on OutOfSpace at max styles" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{
+        .cols = 10,
+        .rows = 10,
+        .max_scrollback = 0,
+    });
+    defer s.deinit();
+
+    // Write content to multiple rows so we have something to split
+    try s.testWriteString("line1\nline2\nline3\nline4\nline5");
+
+    // Remember the original node
+    const original_node = s.cursor.page_pin.node;
+
+    // Increase the page's style capacity to max by repeatedly calling increaseCapacity
+    // Use Screen.increaseCapacity to properly maintain cursor state
+    const max_styles = std.math.maxInt(size.CellCountInt);
+    while (s.cursor.page_pin.node.data.capacity.styles < max_styles) {
+        _ = s.increaseCapacity(
+            s.cursor.page_pin.node,
+            .styles,
+        ) catch break;
+    }
+
+    // Get the page reference after increaseCapacity - cursor may have moved
+    var page = &s.cursor.page_pin.node.data;
+    try testing.expectEqual(max_styles, page.capacity.styles);
+
+    // Fill the style map to capacity using the StyleSet's layout capacity
+    // which accounts for the load factor
+    {
+        page.pauseIntegrityChecks(true);
+        defer page.pauseIntegrityChecks(false);
+        defer page.assertIntegrity();
+
+        const max_items = page.styles.layout.cap;
+        var n: usize = 1;
+        while (n < max_items) : (n += 1) {
+            _ = page.styles.add(
+                page.memory,
+                .{ .bg_color = .{ .rgb = @bitCast(@as(u24, @intCast(n))) } },
+            ) catch break;
+        }
+    }
+
+    // Track the node before setAttribute
+    const node_before_set = s.cursor.page_pin.node;
+
+    // Now try to set a new unique attribute that would require a new style slot
+    // At max capacity, increaseCapacity will return OutOfSpace, triggering page split
+    try s.setAttribute(.bold);
+
+    // The style should have been applied (bold flag set)
+    try testing.expect(s.cursor.style.flags.bold);
+
+    // The cursor should have a valid non-default style_id
+    try testing.expect(s.cursor.style_id != style.default_id);
+
+    // The page should have been split
+    const page_was_split = s.cursor.page_pin.node != node_before_set or
+        node_before_set.next != null or
+        node_before_set.prev != null or
+        s.cursor.page_pin.node != original_node;
+    try testing.expect(page_was_split);
 }

@@ -119,7 +119,7 @@ pub const StreamHandler = struct {
         };
 
         // The config could have changed any of our colors so update mode 2031
-        self.surfaceMessageWriter(.{ .report_color_scheme = false });
+        self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
     }
 
     inline fn surfaceMessageWriter(
@@ -721,7 +721,7 @@ pub const StreamHandler = struct {
                 if (enabled) {
                     self.terminal.saveCursor();
                 } else {
-                    try self.terminal.restoreCursor();
+                    self.terminal.restoreCursor();
                 }
             },
 
@@ -871,7 +871,7 @@ pub const StreamHandler = struct {
                 self.messageWriter(msg);
             },
 
-            .color_scheme => self.surfaceMessageWriter(.{ .report_color_scheme = true }),
+            .color_scheme => self.messageWriter(.{ .color_scheme_report = .{ .force = true } }),
         }
     }
 
@@ -933,7 +933,7 @@ pub const StreamHandler = struct {
     }
 
     pub inline fn restoreCursor(self: *StreamHandler) !void {
-        try self.terminal.restoreCursor();
+        self.terminal.restoreCursor();
     }
 
     pub fn enquiry(self: *StreamHandler) !void {
@@ -956,7 +956,7 @@ pub const StreamHandler = struct {
         try self.setMouseShape(.text);
 
         // Reset resets our palette so we report it for mode 2031.
-        self.surfaceMessageWriter(.{ .report_color_scheme = false });
+        self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
 
         // Clear the progress bar
         self.progressReport(.{ .state = .remove });
