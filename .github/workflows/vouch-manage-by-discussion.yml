@@ -22,7 +22,7 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
 
-      - uses: mitchellh/vouch/action/manage-by-discussion@6803dde571265e13489c3f118200f60b6ab59e4d # v1.3.1
+      - uses: mitchellh/vouch/action/manage-by-discussion@0a63681ac1791b66359e8ccf29eabdd40bdf18e0 # v1.4.1
         with:
           discussion-number: ${{ github.event.discussion.number }}
           comment-node-id: ${{ github.event.comment.node_id }}
