@@ -629,7 +629,16 @@ pub fn print(self: *Terminal, c: u21) !void {
                 // We only create a spacer head if we're at the real edge
                 // of the screen. Otherwise, we clear the space with a narrow.
                 // This allows soft wrapping to work correctly.
-                self.printCell(0, if (right_limit == self.cols) .spacer_head else .narrow);
+                if (right_limit == self.cols) {
+                    // Special-case: we need to set wrap to true even
+                    // though we call printWrap below because if there is
+                    // a page resize during printCell then it'll fail
+                    // integrity checks.
+                    self.screens.active.cursor.page_row.wrap = true;
+                    self.printCell(0, .spacer_head);
+                } else {
+                    self.printCell(0, .narrow);
+                }
                 try self.printWrap();
             }
 
@@ -714,9 +723,14 @@ fn printCell(
                     self.screens.active.cursor.page_row,
                     spacer_cell[0..1],
                 );
+
+                // If we're near the left edge, a wide char may have
+                // wrapped from the previous row, leaving a spacer_head
+                // at the end of that row. Clear it so the previous row
+                // doesn't keep a stale spacer_head.
                 if (self.screens.active.cursor.y > 0 and self.screens.active.cursor.x <= 1) {
                     const head_cell = self.screens.active.cursorCellEndOfPrev();
-                    head_cell.wide = .narrow;
+                    if (head_cell.wide == .spacer_head) head_cell.wide = .narrow;
                 }
             },
 
@@ -735,9 +749,13 @@ fn printCell(
                     self.screens.active.cursor.page_row,
                     wide_cell[0..1],
                 );
+                // If we're near the left edge, a wide char may have
+                // wrapped from the previous row, leaving a spacer_head
+                // at the end of that row. Clear it so the previous row
+                // doesn't keep a stale spacer_head.
                 if (self.screens.active.cursor.y > 0 and self.screens.active.cursor.x <= 1) {
                     const head_cell = self.screens.active.cursorCellEndOfPrev();
-                    head_cell.wide = .narrow;
+                    if (head_cell.wide == .spacer_head) head_cell.wide = .narrow;
                 }
             },
 
@@ -1947,6 +1965,7 @@ pub fn insertLines(self: *Terminal, count: usize) void {
             }
         } else {
             // Clear the cells for this row, it has been shifted.
+            self.rowWillBeShifted(&cur_p.node.data, cur_row);
             const page = &cur_p.node.data;
             const cells = page.getCells(cur_row);
             self.screens.active.clearCells(
@@ -2134,6 +2153,7 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
             }
         } else {
             // Clear the cells for this row, it's from out of bounds.
+            self.rowWillBeShifted(&cur_p.node.data, cur_row);
             const page = &cur_p.node.data;
             const cells = page.getCells(cur_row);
             self.screens.active.clearCells(
@@ -2166,6 +2186,12 @@ pub fn insertBlanks(self: *Terminal, count: usize) void {
     // xterm does.
     self.screens.active.cursor.pending_wrap = false;
 
+    // If we're given a zero then we do nothing. The rest of this function
+    // assumes count > 0 and will crash if zero so return early. Note that
+    // this shouldn't be possible with real CSI sequences because the value
+    // is clamped to 1 min.
+    if (count == 0) return;
+
     // If our cursor is outside the margins then do nothing. We DO reset
     // wrap state still so this must remain below the above logic.
     if (self.screens.active.cursor.x < self.scrolling_region.left or
@@ -2193,6 +2219,18 @@ pub fn insertBlanks(self: *Terminal, count: usize) void {
 
     // Remaining cols from our cursor to the right margin.
     const rem = self.scrolling_region.right - self.screens.active.cursor.x + 1;
+
+    // If the cell at the right margin is wide, its spacer tail is
+    // outside the scroll region and would be orphaned by either the
+    // shift or the clear. Clean up both halves up front.
+    {
+        const right_cell: *Cell = @ptrCast(left + (rem - 1));
+        if (right_cell.wide == .wide) self.screens.active.clearCells(
+            page,
+            self.screens.active.cursor.page_row,
+            @as([*]Cell, @ptrCast(right_cell))[0..2],
+        );
+    }
 
     // We can only insert blanks up to our remaining cols
     const adjusted_count = @min(count, rem);
@@ -3312,6 +3350,44 @@ test "Terminal: print over wide char at 0,0" {
 
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
     try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 1 } }));
+}
+
+test "Terminal: print over wide char at col 0 corrupts previous row" {
+    // Crash found by AFL++ fuzzer (afl-out/stream/default/crashes/id:000002).
+    //
+    // printCell, when overwriting a wide cell with a narrow cell at x<=1
+    // and y>0, sets the last cell of the previous row to .narrow — even
+    // when that cell is a .spacer_tail rather than a .spacer_head. This
+    // orphans the .wide cell at cols-2.
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Fill rows 0 and 1 with wide chars (5 per row on a 10-col terminal).
+    for (0..10) |_| try t.print(0x4E2D);
+
+    // Move cursor to row 1, col 0 (on top of a wide char) and print a
+    // narrow character. This triggers printCell's .wide branch which
+    // corrupts row 0's last cell: col 9 changes from .spacer_tail to
+    // .narrow, orphaning the .wide at col 8.
+    t.setCursorPos(2, 1);
+    try t.print('A');
+
+    // Row 1, col 0 should be narrow (we just overwrote the wide char).
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+        try testing.expectEqual(Cell.Wide.narrow, list_cell.cell.wide);
+    }
+    // Row 0, col 8 should still be .wide (the last wide char on the row).
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 8, .y = 0 } }).?;
+        try testing.expectEqual(Cell.Wide.wide, list_cell.cell.wide);
+    }
+    // Row 0, col 9 must remain .spacer_tail to pair with the .wide at col 8.
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 9, .y = 0 } }).?;
+        try testing.expectEqual(Cell.Wide.spacer_tail, list_cell.cell.wide);
+    }
 }
 
 test "Terminal: print over wide spacer tail" {
@@ -5104,6 +5180,50 @@ test "Terminal: overwrite hyperlink" {
     }
 
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+}
+
+// Printing a wide char at the right edge with an active hyperlink causes
+// printCell to write a spacer_head before printWrap sets the row wrap
+// flag. The integrity check inside setHyperlink (or increaseCapacity)
+// sees the unwrapped spacer head and panics. Found via fuzzing.
+test "Terminal: print wide char at right edge with hyperlink" {
+    var t = try init(testing.allocator, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    try t.screens.active.startHyperlink("http://example.com", null);
+
+    // Move cursor to the last column (1-indexed)
+    t.setCursorPos(1, 10);
+
+    // Print a wide character; this will call printCell(0, .spacer_head)
+    // at the right edge before calling printWrap, triggering the
+    // integrity violation.
+    try t.print(0x4E2D); // U+4E2D '中'
+
+    // Cursor wraps to row 2, after the wide char + spacer tail
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+
+    // Row 0, col 9: spacer head with hyperlink
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 9, .y = 0 } }).?;
+        try testing.expectEqual(Cell.Wide.spacer_head, list_cell.cell.wide);
+        try testing.expect(list_cell.cell.hyperlink);
+        try testing.expect(list_cell.row.wrap);
+    }
+    // Row 1, col 0: the wide char with hyperlink
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+        try testing.expectEqual(@as(u21, 0x4E2D), list_cell.cell.content.codepoint);
+        try testing.expectEqual(Cell.Wide.wide, list_cell.cell.wide);
+        try testing.expect(list_cell.cell.hyperlink);
+    }
+    // Row 1, col 1: spacer tail with hyperlink
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 1 } }).?;
+        try testing.expectEqual(Cell.Wide.spacer_tail, list_cell.cell.wide);
+        try testing.expect(list_cell.cell.hyperlink);
+    }
 }
 
 test "Terminal: linefeed and carriage return" {
@@ -9409,6 +9529,25 @@ test "Terminal: DECALN resets graphemes with protected mode" {
     }
 }
 
+test "Terminal: insertBlanks zero" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 5, .rows = 2 });
+    defer t.deinit(alloc);
+
+    try t.print('A');
+    try t.print('B');
+    try t.print('C');
+    t.setCursorPos(1, 1);
+
+    t.insertBlanks(0);
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("ABC", str);
+    }
+}
+
 test "Terminal: insertBlanks" {
     // NOTE: this is not verified with conformance tests, so these
     // tests might actually be verifying wrong behavior.
@@ -9797,6 +9936,77 @@ test "Terminal: insertBlanks pushes hyperlink off end completely" {
         try testing.expect(!cell.hyperlink);
         const id = list_cell.node.data.lookupHyperlink(cell);
         try testing.expect(id == null);
+    }
+}
+
+test "Terminal: insertBlanks wide char straddling right margin" {
+    // Crash found by AFL++ fuzzer.
+    //
+    // When a wide character straddles the right scroll margin (head at the
+    // margin, spacer_tail just beyond it), insertBlanks shifts the wide head
+    // away via swapCells but leaves the orphaned spacer_tail in place,
+    // causing a page integrity violation.
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Fill row: A B C D 橋 _ _ _ _ _
+    // Positions: 0 1 2 3 4W 5T 6 7 8 9
+    t.setCursorPos(1, 1);
+    for ("ABCD") |c| try t.print(c);
+    try t.print('橋'); // wide char: head at 4, spacer_tail at 5
+
+    // Set right margin so the wide head is AT the boundary and the
+    // spacer_tail is just outside it.
+    t.scrolling_region.right = 4;
+
+    // Position cursor at x=2 (1-indexed col 3) and insert one blank.
+    // This triggers the swap loop which displaces the wide head at
+    // position 4 without clearing the spacer_tail at position 5.
+    t.setCursorPos(1, 3);
+    t.insertBlanks(1);
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("AB CD", str);
+    }
+}
+
+test "Terminal: insertBlanks wide char spacer_tail orphaned beyond right margin" {
+    // Regression test for AFL++ crash.
+    //
+    // When insertBlanks clears the entire region from cursor to the right
+    // margin (scroll_amount == 0), a wide character whose head is AT the
+    // right margin gets cleared but its spacer_tail just beyond the margin
+    // is left behind, causing a page integrity violation:
+    //   "spacer tail not following wide"
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Fill cols 0–9 with wide chars: 中中中中中
+    // Positions: 0W 1T 2W 3T 4W 5T 6W 7T 8W 9T
+    for (0..5) |_| try t.print(0x4E2D);
+
+    // Set left/right margins so that the last wide char (cols 8–9)
+    // straddles the boundary: head at col 8 (inside), tail at col 9 (outside).
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(1, 9); // 1-indexed: left=0, right=8
+
+    // Cursor is now at (0, 0) after DECSLRM.  Print a narrow char to
+    // advance cursor to col 1.
+    try t.print('a');
+
+    // ICH 8: insert 8 blanks at cursor x=1.
+    // rem = right(8) - x(1) + 1 = 8, adjusted_count = 8, scroll_amount = 0.
+    // The code clears cols 1–8 without noticing the spacer_tail at col 9.
+    t.insertBlanks(8);
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("a", str);
     }
 }
 
@@ -12762,4 +12972,33 @@ test "Terminal: mode 1049 alt screen plain" {
         defer testing.allocator.free(str);
         try testing.expectEqualStrings("", str);
     }
+}
+
+// Reproduces a crash found by AFL++ fuzzer (afl-out/stream/default/crashes/
+// id:000007,sig:06,src:004522). The crash is a page integrity violation
+// "spacer tail not following wide" triggered during scrollUp -> deleteLines
+// -> clearCells. When deleteLines count >= scroll region height, all rows
+// are cleared (no shifting), so rowWillBeShifted is never called and wide
+// characters straddling the right margin boundary leave orphaned spacer_tails.
+test "Terminal: deleteLines wide char at right margin with full clear" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    // Place a wide character at col 39 (1-indexed) on several rows.
+    // The wide cell lands at col 38 (0-indexed) with spacer_tail at col 39.
+    t.setCursorPos(10, 39);
+    try t.print(0x4E2D); // '中'
+
+    // Set left/right scroll margins so scrolling_region.right = 38.
+    // clearCells will clear cells[4..39], which includes the wide cell
+    // at col 38 but NOT the spacer_tail at col 39.
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(5, 39);
+
+    // scrollUp with count >= region height causes deleteLines to clear
+    // ALL rows without any shifting, so rowWillBeShifted is never called
+    // and the orphaned spacer_tail at col 39 triggers a page integrity
+    // violation in clearCells.
+    try t.scrollUp(t.rows);
 }

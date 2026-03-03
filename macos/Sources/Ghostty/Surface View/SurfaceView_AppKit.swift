@@ -678,7 +678,7 @@ extension Ghostty {
             guard let healthAny = notification.userInfo?["health"] else { return }
             guard let health = healthAny as? ghostty_action_renderer_health_e else { return }
             DispatchQueue.main.async { [weak self] in
-                self?.healthy = health == GHOSTTY_RENDERER_HEALTH_OK
+                self?.healthy = health == GHOSTTY_RENDERER_HEALTH_HEALTHY
             }
         }
 
@@ -1632,14 +1632,17 @@ extension Ghostty {
         }
 
         /// Show a user notification and associate it with this surface
-        func showUserNotification(title: String, body: String) {
+        func showUserNotification(title: String, body: String, requireFocus: Bool = true) {
             let content = UNMutableNotificationContent()
             content.title = title
             content.subtitle = self.title
             content.body = body
             content.sound = UNNotificationSound.default
             content.categoryIdentifier = Ghostty.userNotificationCategory
-            content.userInfo = ["surface": self.id.uuidString]
+            content.userInfo = [
+                "surface": self.id.uuidString,
+                "requireFocus": requireFocus,
+            ]
 
             let uuid = UUID().uuidString
             let request = UNNotificationRequest(

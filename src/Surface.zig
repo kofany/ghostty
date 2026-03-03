@@ -2973,6 +2973,9 @@ fn maybeHandleBinding(
         // If our action was "ignore" then we return the special input
         // effect of "ignored".
         for (actions) |action| if (action == .ignore) {
+            // If we're in a sequence, clear it.
+            self.endKeySequence(.drop, .retain);
+
             return .ignored;
         };
     }
@@ -4268,6 +4271,9 @@ fn maybePromptClick(self: *Surface) !bool {
     // If our screen doesn't handle any prompt clicks, then we never
     // do anything.
     if (screen.semantic_prompt.click == .none) return false;
+
+    // If cursor-click-to-move is disabled, we don't do any prompt clicking.
+    if (!self.config.cursor_click_to_move) return false;
 
     // If our cursor isn't currently at a prompt then we don't handle
     // prompt clicks because we can't move if we're not in a prompt!
