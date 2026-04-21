@@ -3,11 +3,17 @@ const assert = std.debug.assert;
 const builtin = @import("builtin");
 const buildpkg = @import("src/build/main.zig");
 
-const appVersion = @import("build.zig.zon").version;
-const minimumZigVersion = @import("build.zig.zon").minimum_zig_version;
+/// App version from build.zig.zon.
+const app_zon_version = @import("build.zig.zon").version;
+
+/// Libghostty version. We use a separate version from the app.
+const lib_version = "0.1.0-dev";
+
+/// Minimum required zig version.
+const minimum_zig_version = @import("build.zig.zon").minimum_zig_version;
 
 comptime {
-    buildpkg.requireZig(minimumZigVersion);
+    buildpkg.requireZig(minimum_zig_version);
 }
 
 pub fn build(b: *std.Build) !void {
@@ -15,7 +21,24 @@ pub fn build(b: *std.Build) !void {
     // want to know what options are available, you can run `--help` or
     // you can read `src/build/Config.zig`.
 
-    const config = try buildpkg.Config.init(b, appVersion);
+    // If we have a VERSION file (present in source tarballs) then we
+    // use that as the version source of truth. Otherwise we fall back
+    // to what is in the build.zig.zon.
+    const file_version: ?[]const u8 = if (b.build_root.handle.readFileAlloc(
+        b.allocator,
+        "VERSION",
+        128,
+    )) |content| std.mem.trim(
+        u8,
+        content,
+        &std.ascii.whitespace,
+    ) else |_| null;
+
+    const config = try buildpkg.Config.init(
+        b,
+        file_version orelse app_zon_version,
+        lib_version,
+    );
     const test_filters = b.option(
         [][]const u8,
         "test-filter",
@@ -129,6 +152,20 @@ pub fn build(b: *std.Build) !void {
         ).step);
     }
 
+    // libghostty-vt xcframework (Apple only, universal binary).
+    // Only when building on macOS (not cross-compiling) since
+    // xcodebuild is required.
+    if (builtin.os.tag.isDarwin() and config.target.result.os.tag.isDarwin()) {
+        const apple_libs = try buildpkg.GhosttyLibVt.initStaticAppleUniversal(
+            b,
+            &config,
+            &deps,
+            &mod,
+        );
+        const xcframework = buildpkg.GhosttyLibVt.xcframework(&apple_libs, b);
+        b.getInstallStep().dependOn(xcframework.step);
+    }
+
     // Helpgen
     if (config.emit_helpgen) deps.help_strings.install();
 
@@ -153,11 +190,11 @@ pub fn build(b: *std.Build) !void {
         if (!config.target.result.os.tag.isDarwin()) {
             lib_shared.installHeader(); // Only need one header
             if (config.target.result.os.tag == .windows) {
-                lib_shared.install("ghostty.dll");
-                lib_static.install("ghostty-static.lib");
+                lib_shared.install("ghostty-internal.dll");
+                lib_static.install("ghostty-internal-static.lib");
             } else {
-                lib_shared.install("libghostty.so");
-                lib_static.install("libghostty.a");
+                lib_shared.install("ghostty-internal.so");
+                lib_static.install("ghostty-internal.a");
             }
         }
     }
@@ -292,8 +329,8 @@ pub fn build(b: *std.Build) !void {
         test_lib_vt_step.dependOn(&mod_vt_c_test_run.step);
     }
 
-    // Tests
-    {
+    // Tests (skip when building libghostty-vt)
+    if (!config.emit_lib_vt) {
         // Full unit tests
         const test_exe = b.addTest(.{
             .name = "ghostty-test",

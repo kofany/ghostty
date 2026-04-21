@@ -21,6 +21,12 @@ pub const BuildInfo = enum(c_int) {
     kitty_graphics = 2,
     tmux_control_mode = 3,
     optimize = 4,
+    version_string = 5,
+    version_major = 6,
+    version_minor = 7,
+    version_patch = 8,
+    version_pre = 9,
+    version_build = 10,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: BuildInfo) type {
@@ -28,6 +34,8 @@ pub const BuildInfo = enum(c_int) {
             .invalid => void,
             .simd, .kitty_graphics, .tmux_control_mode => bool,
             .optimize => OptimizeMode,
+            .version_string, .version_pre, .version_build => lib.String,
+            .version_major, .version_minor, .version_patch => usize,
         };
     }
 };
@@ -67,6 +75,24 @@ fn getTyped(
             .ReleaseSmall => .release_small,
             .ReleaseFast => .release_fast,
         },
+        .version_string => out.* = .{ .ptr = build_options.version_string.ptr, .len = build_options.version_string.len },
+        .version_major => out.* = build_options.version_major,
+        .version_minor => out.* = build_options.version_minor,
+        .version_patch => out.* = build_options.version_patch,
+        .version_pre => {
+            if (build_options.version_pre) |b| {
+                out.* = .{ .ptr = b.ptr, .len = b.len };
+            } else {
+                out.* = .{ .ptr = "", .len = 0 };
+            }
+        },
+        .version_build => {
+            if (build_options.version_build) |b| {
+                out.* = .{ .ptr = b.ptr, .len = b.len };
+            } else {
+                out.* = .{ .ptr = "", .len = 0 };
+            }
+        },
     }
 
     return .success;
@@ -103,6 +129,46 @@ test "get optimize" {
         .ReleaseSmall => .release_small,
         .ReleaseFast => .release_fast,
     }, value);
+}
+
+test "get version_string" {
+    const testing = std.testing;
+    var value: lib.String = undefined;
+    try testing.expectEqual(Result.success, get(.version_string, @ptrCast(&value)));
+    try testing.expect(value.len > 0);
+}
+
+test "get version_major" {
+    const testing = std.testing;
+    var value: usize = undefined;
+    try testing.expectEqual(Result.success, get(.version_major, @ptrCast(&value)));
+    try testing.expectEqual(build_options.version_major, value);
+}
+
+test "get version_minor" {
+    const testing = std.testing;
+    var value: usize = undefined;
+    try testing.expectEqual(Result.success, get(.version_minor, @ptrCast(&value)));
+    try testing.expectEqual(build_options.version_minor, value);
+}
+
+test "get version_patch" {
+    const testing = std.testing;
+    var value: usize = undefined;
+    try testing.expectEqual(Result.success, get(.version_patch, @ptrCast(&value)));
+    try testing.expectEqual(build_options.version_patch, value);
+}
+
+test "get version_pre" {
+    const testing = std.testing;
+    var value: lib.String = undefined;
+    try testing.expectEqual(Result.success, get(.version_pre, @ptrCast(&value)));
+}
+
+test "get version_build" {
+    const testing = std.testing;
+    var value: lib.String = undefined;
+    try testing.expectEqual(Result.success, get(.version_build, @ptrCast(&value)));
 }
 
 test "get invalid" {
