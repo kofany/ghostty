@@ -2042,6 +2042,8 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             return
         }
 
+        let hadMarkedText = hasMarkedText()
+
         // If insertText is called, our preedit must be over.
         unmarkText()
 
@@ -2050,6 +2052,13 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         if var acc = keyTextAccumulator {
             acc.append(chars)
             keyTextAccumulator = acc
+            return
+        }
+
+        if hadMarkedText, !chars.isEmpty {
+            // Send preedit commits as key events instead of raw text for
+            // keybind interpretation by programs.
+            _ = committedPreeditTextAction(GHOSTTY_ACTION_PRESS, text: chars)
             return
         }
 
@@ -2220,7 +2229,6 @@ extension Ghostty.SurfaceView {
     static let dropTypes: Set<NSPasteboard.PasteboardType> = [
         .string,
         .fileURL,
-        .URL
     ]
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
@@ -2248,59 +2256,46 @@ extension Ghostty.SurfaceView {
             uploadConfig = Ghostty.ImageUploadConfig()
         }
 
-        let content: String?
-        if let url = pb.string(forType: .URL) {
-            // URLs first, they get escaped as-is.
-            content = Ghostty.Shell.escape(url)
-        } else if let urls = pb.readObjects(forClasses: [NSURL.self]) as? [URL],
-           urls.count > 0 {
-            // Check if we should try image upload
-            if uploadConfig.enable, urls.count == 1, let fileURL = urls.first {
-                let uploader = Ghostty.ImageUploader(config: uploadConfig)
-                if uploader.isImageFile(fileURL.path) {
-                    // Perform async upload
-                    Task {
-                        let result = await uploader.upload(filePath: fileURL.path)
-                        await MainActor.run {
-                            switch result {
-                            case .success(let uploadedURL):
-                                self.insertText(uploadedURL, replacementRange: NSMakeRange(0, 0))
-                            case .failure(let error):
-                                switch uploadConfig.fallback {
-                                case .path:
-                                    self.insertText(
-                                        Ghostty.Shell.escape(fileURL.path),
-                                        replacementRange: NSMakeRange(0, 0)
-                                    )
-                                case .error:
-                                    Ghostty.logger.error("Image upload failed: \(error)")
-                                case .empty:
-                                    break
-                                }
-                            case .fallback:
+        // If a single image file was dropped and uploads are enabled, upload it
+        // and insert the resulting URL instead of the local path.
+        if uploadConfig.enable,
+           let urls = pb.readObjects(forClasses: [NSURL.self]) as? [URL],
+           urls.count == 1,
+           let fileURL = urls.first {
+            let uploader = Ghostty.ImageUploader(config: uploadConfig)
+            if uploader.isImageFile(fileURL.path) {
+                // Perform async upload
+                Task {
+                    let result = await uploader.upload(filePath: fileURL.path)
+                    await MainActor.run {
+                        switch result {
+                        case .success(let uploadedURL):
+                            self.insertText(uploadedURL, replacementRange: NSMakeRange(0, 0))
+                        case .failure(let error):
+                            switch uploadConfig.fallback {
+                            case .path:
                                 self.insertText(
                                     Ghostty.Shell.escape(fileURL.path),
                                     replacementRange: NSMakeRange(0, 0)
                                 )
+                            case .error:
+                                Ghostty.logger.error("Image upload failed: \(error)")
+                            case .empty:
+                                break
                             }
+                        case .fallback:
+                            self.insertText(
+                                Ghostty.Shell.escape(fileURL.path),
+                                replacementRange: NSMakeRange(0, 0)
+                            )
                         }
                     }
-                    return true
                 }
+                return true
             }
-
-            // File URLs next. They get escaped individually and then joined by a
-            // space if there are multiple.
-            content = urls
-                .map { Ghostty.Shell.escape($0.path) }
-                .joined(separator: " ")
-        } else if let str = pb.string(forType: .string) {
-            // Strings are not escaped because they may be copy/pasting a
-            // command they want to execute.
-            content = str
-        } else {
-            content = nil
         }
+
+        let content = pb.getOpinionatedStringContents()
 
         if let content {
             DispatchQueue.main.async {
