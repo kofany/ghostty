@@ -1,9 +1,12 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const testing = std.testing;
 const build_options = @import("terminal_options");
 const lib = @import("../lib.zig");
 const CAllocator = lib.alloc.Allocator;
 pub const ZigTerminal = @import("../Terminal.zig");
+const Action = @import("../stream.zig").Action;
+const osc = @import("../osc.zig");
 const Stream = @import("../stream_terminal.zig").Stream;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
@@ -26,8 +29,11 @@ const style_c = @import("style.zig");
 const color = @import("../color.zig");
 const clipboard = @import("../clipboard.zig");
 const Result = @import("result.zig").Result;
+const assert = @import("../../quirks.zig").inlineAssert;
 
 const Handler = @import("../stream_terminal.zig").Handler;
+
+const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max_path_bytes;
 
 const log = std.log.scoped(.terminal_c);
 
@@ -35,10 +41,28 @@ const log = std.log.scoped(.terminal_c);
 /// such as the persistent VT stream needed to handle escape sequences split
 /// across multiple vt_write calls.
 const TerminalWrapper = struct {
+    const IoImpl = if (builtin.os.tag != .freestanding) *std.Io.Threaded else void;
+
     terminal: *ZigTerminal,
+    /// We need to keep an I/O instance here as part of the terminal since we
+    /// have no way of taking it in the C API. This is set up in `new` and
+    /// destroyed on `free`.
+    ///
+    /// This is set to null on freestanding platforms, which get std.Io.failing
+    /// instead.
+    io_impl: IoImpl,
+    /// We also need to store a temp dir path for some operations (e.g., kitty
+    /// graphics). This provides stable storage for the API calls.
+    tmp_dir_path: [max_path_bytes]u8,
     stream: Stream,
     effects: Effects = .{},
     tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
+
+    /// Fetches a `TerminalWrapper` reference from a `Handler`.
+    fn fromHandler(handler: *Handler) *TerminalWrapper {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        return @alignCast(@fieldParentPtr("stream", stream_ptr));
+    }
 };
 
 /// A single MIME representation in a clipboard write.
@@ -59,6 +83,27 @@ pub const ClipboardWrite = extern struct {
     contents_len: usize,
 };
 
+/// A request to show a desktop notification.
+///
+/// C: GhosttyTerminalDesktopNotification
+pub const DesktopNotification = extern struct {
+    size: usize,
+    title: lib.String,
+    body: lib.String,
+};
+
+/// C: GhosttyTerminalProgressState
+pub const ProgressState = osc.Command.ProgressReport.State;
+
+/// A progress report emitted by the running program.
+///
+/// C: GhosttyTerminalProgressReport
+pub const ProgressReport = extern struct {
+    size: usize,
+    state: ProgressState,
+    progress: i8,
+};
+
 /// C callback state for terminal effects. Trampolines are always
 /// installed on the stream handler; they check these fields and
 /// no-op when the corresponding callback is null.
@@ -67,11 +112,13 @@ const Effects = struct {
     write_pty: ?WritePtyFn = null,
     bell: ?BellFn = null,
     color_scheme: ?ColorSchemeFn = null,
+    desktop_notification: ?DesktopNotificationFn = null,
     device_attributes_cb: ?DeviceAttributesFn = null,
     enquiry: ?EnquiryFn = null,
     xtversion: ?XtversionFn = null,
     title_changed: ?TitleChangedFn = null,
     pwd_changed: ?PwdChangedFn = null,
+    progress_report: ?ProgressReportFn = null,
     size_cb: ?SizeFn = null,
     clipboard_write: ?ClipboardWriteFn = null,
 
@@ -108,11 +155,18 @@ const Effects = struct {
     /// and its contents are borrowed and only valid for the callback duration.
     pub const ClipboardWriteFn = *const fn (Terminal, ?*anyopaque, *const ClipboardWrite) callconv(lib.calling_conv) clipboard.WriteResult;
 
+    /// C function pointer type for the desktop_notification callback. The
+    /// request and its strings are borrowed for the callback duration.
+    pub const DesktopNotificationFn = *const fn (Terminal, ?*anyopaque, *const DesktopNotification) callconv(lib.calling_conv) void;
+
     /// C function pointer type for the title_changed callback.
     pub const TitleChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the pwd_changed callback.
     pub const PwdChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for the progress_report callback.
+    pub const ProgressReportFn = *const fn (Terminal, ?*anyopaque, *const ProgressReport) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the size callback.
     /// Returns true and fills out_size if size is available,
@@ -149,22 +203,19 @@ const Effects = struct {
     };
 
     fn writePtyTrampoline(handler: *Handler, data: [:0]const u8) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.write_pty orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len);
     }
 
     fn bellTrampoline(handler: *Handler) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.bell orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
     fn clipboardWriteTrampoline(handler: *Handler, write: clipboard.Write) clipboard.WriteResult {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.clipboard_write orelse return .unsupported;
 
         // Most protocols currently produce one representation, so keep that
@@ -200,9 +251,28 @@ const Effects = struct {
         return func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
     }
 
+    fn desktopNotificationTrampoline(
+        handler: *Handler,
+        notification: Action.ShowDesktopNotification,
+    ) void {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.desktop_notification orelse return;
+        const request: DesktopNotification = .{
+            .size = @sizeOf(DesktopNotification),
+            .title = .{
+                .ptr = notification.title.ptr,
+                .len = notification.title.len,
+            },
+            .body = .{
+                .ptr = notification.body.ptr,
+                .len = notification.body.len,
+            },
+        };
+        func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
+    }
+
     fn colorSchemeTrampoline(handler: *Handler) ?device_status.ColorScheme {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.color_scheme orelse return null;
         var scheme: device_status.ColorScheme = undefined;
         if (func(@ptrCast(wrapper), wrapper.effects.userdata, &scheme)) return scheme;
@@ -210,8 +280,7 @@ const Effects = struct {
     }
 
     fn deviceAttributesTrampoline(handler: *Handler) device_attributes.Attributes {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.device_attributes_cb orelse return .{};
 
         // Get our attributes from the callback.
@@ -241,8 +310,7 @@ const Effects = struct {
     }
 
     fn enquiryTrampoline(handler: *Handler) []const u8 {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.enquiry orelse return "";
         const result = func(@ptrCast(wrapper), wrapper.effects.userdata);
         if (result.len == 0) return "";
@@ -250,8 +318,7 @@ const Effects = struct {
     }
 
     fn xtversionTrampoline(handler: *Handler) []const u8 {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.xtversion orelse return "";
         const result = func(@ptrCast(wrapper), wrapper.effects.userdata);
         if (result.len == 0) return "";
@@ -259,22 +326,33 @@ const Effects = struct {
     }
 
     fn titleChangedTrampoline(handler: *Handler) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.title_changed orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
     fn pwdChangedTrampoline(handler: *Handler) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.pwd_changed orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
+    fn progressReportTrampoline(
+        handler: *Handler,
+        report: osc.Command.ProgressReport,
+    ) void {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.progress_report orelse return;
+        const c_report: ProgressReport = .{
+            .size = @sizeOf(ProgressReport),
+            .state = @enumFromInt(@intFromEnum(report.state)),
+            .progress = if (report.progress) |value| @intCast(value) else -1,
+        };
+        func(@ptrCast(wrapper), wrapper.effects.userdata, &c_report);
+    }
+
     fn sizeTrampoline(handler: *Handler) ?size_report.Size {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.size_cb orelse return null;
         var s: size_report.Size = undefined;
         if (func(@ptrCast(wrapper), wrapper.effects.userdata, &s)) return s;
@@ -295,13 +373,6 @@ pub fn zigTerminal(terminal_: Terminal) ?*ZigTerminal {
     return (terminal_ orelse return null).terminal;
 }
 
-/// C: GhosttyTerminalOptions
-pub const Options = extern struct {
-    cols: size.CellCountInt,
-    rows: size.CellCountInt,
-    max_scrollback: usize,
-};
-
 const NewError = error{
     InvalidValue,
     OutOfMemory,
@@ -310,9 +381,10 @@ const NewError = error{
 pub fn new(
     alloc_: ?*const CAllocator,
     result: *Terminal,
-    opts: Options,
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
 ) callconv(lib.calling_conv) Result {
-    result.* = new_(alloc_, opts) catch |err| {
+    result.* = new_(alloc_, cols, rows) catch |err| {
         result.* = null;
         return switch (err) {
             error.InvalidValue => .invalid_value,
@@ -325,9 +397,10 @@ pub fn new(
 
 fn new_(
     alloc_: ?*const CAllocator,
-    opts: Options,
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
 ) NewError!*TerminalWrapper {
-    if (opts.cols == 0 or opts.rows == 0) return error.InvalidValue;
+    if (cols == 0 or rows == 0) return error.InvalidValue;
 
     const alloc = lib.alloc.default(alloc_);
     const t = alloc.create(ZigTerminal) catch
@@ -338,12 +411,23 @@ fn new_(
         return error.OutOfMemory;
     errdefer alloc.destroy(wrapper);
 
+    const has_nonfailing_io = builtin.os.tag != .freestanding;
+    const io_impl: TerminalWrapper.IoImpl = if (has_nonfailing_io) io_impl: {
+        const ptr = try alloc.create(std.Io.Threaded);
+        ptr.* = .init_single_threaded;
+        break :io_impl ptr;
+    } else {};
+    errdefer if (has_nonfailing_io) alloc.destroy(io_impl);
+
     // Setup our terminal
-    t.* = try .init(alloc, .{
-        .cols = opts.cols,
-        .rows = opts.rows,
-        .max_scrollback = opts.max_scrollback,
-    });
+    t.* = try .init(
+        if (has_nonfailing_io) io_impl.io() else std.Io.failing,
+        alloc,
+        .{
+            .cols = cols,
+            .rows = rows,
+        },
+    );
     errdefer t.deinit(alloc);
 
     // libghostty-vt embedders don't necessarily install Ghostty's shell
@@ -358,17 +442,21 @@ fn new_(
         .write_pty = &Effects.writePtyTrampoline,
         .bell = &Effects.bellTrampoline,
         .color_scheme = &Effects.colorSchemeTrampoline,
+        .desktop_notification = &Effects.desktopNotificationTrampoline,
         .device_attributes = &Effects.deviceAttributesTrampoline,
         .enquiry = &Effects.enquiryTrampoline,
         .xtversion = &Effects.xtversionTrampoline,
         .title_changed = &Effects.titleChangedTrampoline,
         .pwd_changed = &Effects.pwdChangedTrampoline,
+        .progress_report = &Effects.progressReportTrampoline,
         .size = &Effects.sizeTrampoline,
         .clipboard_write = &Effects.clipboardWriteTrampoline,
     };
 
     wrapper.* = .{
         .terminal = t,
+        .io_impl = io_impl,
+        .tmp_dir_path = undefined, // Only used if temporary directory is set with API calls
         .stream = .initAlloc(alloc, handler),
     };
 
@@ -401,9 +489,7 @@ pub fn compress(
 ) callconv(lib.calling_conv) Result {
     const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
     const out_result = out_result_ orelse return .invalid_value;
-    const mode = std.meta.intToEnum(CompressionMode, mode_) catch
-        return .invalid_value;
-
+    const mode = std.enums.fromInt(CompressionMode, mode_) orelse return .invalid_value;
     out_result.* = t.compress(mode);
     return .success;
 }
@@ -437,6 +523,10 @@ pub const Option = enum(c_int) {
     glyph_protocol = 24,
     pwd_changed = 25,
     clipboard_write = 26,
+    scrollback_max_bytes = 27,
+    scrollback_max_lines = 28,
+    desktop_notification = 29,
+    progress_report = 30,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -445,11 +535,13 @@ pub const Option = enum(c_int) {
             .write_pty => ?Effects.WritePtyFn,
             .bell => ?Effects.BellFn,
             .color_scheme => ?Effects.ColorSchemeFn,
+            .desktop_notification => ?Effects.DesktopNotificationFn,
             .device_attributes => ?Effects.DeviceAttributesFn,
             .enquiry => ?Effects.EnquiryFn,
             .xtversion => ?Effects.XtversionFn,
             .title_changed => ?Effects.TitleChangedFn,
             .pwd_changed => ?Effects.PwdChangedFn,
+            .progress_report => ?Effects.ProgressReportFn,
             .size_cb => ?Effects.SizeFn,
             .clipboard_write => ?Effects.ClipboardWriteFn,
             .title, .pwd => ?*const lib.String,
@@ -457,11 +549,15 @@ pub const Option = enum(c_int) {
             .color_palette => ?*const color.PaletteC,
             .kitty_image_storage_limit => ?*const u64,
             .kitty_image_medium_file,
-            .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
             .glyph_protocol,
             => ?*const bool,
-            .apc_max_bytes, .apc_max_bytes_kitty => ?*const usize,
+            .kitty_image_medium_temp_file => ?*const lib.String,
+            .apc_max_bytes,
+            .apc_max_bytes_kitty,
+            .scrollback_max_bytes,
+            .scrollback_max_lines,
+            => ?*const usize,
             .selection => ?*const selection_c.CSelection,
             .default_cursor_style => ?*const TerminalCursorStyle,
             .default_cursor_blink => ?*const bool,
@@ -475,7 +571,7 @@ pub fn set(
     value: ?*const anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(Option, @intFromEnum(option)) catch {
+        _ = std.enums.fromInt(Option, @intFromEnum(option)) orelse {
             log.warn("terminal_set invalid option value={d}", .{@intFromEnum(option)});
             return .invalid_value;
         };
@@ -502,11 +598,13 @@ fn setTyped(
         .write_pty => wrapper.effects.write_pty = value,
         .bell => wrapper.effects.bell = value,
         .color_scheme => wrapper.effects.color_scheme = value,
+        .desktop_notification => wrapper.effects.desktop_notification = value,
         .device_attributes => wrapper.effects.device_attributes_cb = value,
         .enquiry => wrapper.effects.enquiry = value,
         .xtversion => wrapper.effects.xtversion = value,
         .title_changed => wrapper.effects.title_changed = value,
         .pwd_changed => wrapper.effects.pwd_changed = value,
+        .progress_report => wrapper.effects.progress_report = value,
         .size_cb => wrapper.effects.size_cb = value,
         .clipboard_write => wrapper.effects.clipboard_write = value,
         .title => {
@@ -541,11 +639,10 @@ fn setTyped(
             var it = wrapper.terminal.screens.all.iterator();
             while (it.next()) |entry| {
                 const screen = entry.value.*;
-                screen.kitty_images.setLimit(screen.alloc, screen, limit) catch return .out_of_memory;
+                screen.kitty_images.setLimit(screen.io, screen.alloc, screen, limit) catch return .out_of_memory;
             }
         },
         .kitty_image_medium_file,
-        .kitty_image_medium_temp_file,
         .kitty_image_medium_shared_mem,
         => {
             if (comptime !build_options.kitty_graphics) return .success;
@@ -555,9 +652,28 @@ fn setTyped(
                 const screen = entry.value.*;
                 switch (option) {
                     .kitty_image_medium_file => screen.kitty_images.image_limits.file = val,
-                    .kitty_image_medium_temp_file => screen.kitty_images.image_limits.temporary_file = val,
                     .kitty_image_medium_shared_mem => screen.kitty_images.image_limits.shared_memory = val,
                     else => unreachable,
+                }
+            }
+        },
+        .kitty_image_medium_temp_file => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            if (value) |v| {
+                if (v.len > wrapper.tmp_dir_path.len) return .out_of_memory;
+                @memcpy(wrapper.tmp_dir_path[0..v.len], v.ptr[0..v.len]);
+                var it = wrapper.terminal.screens.all.iterator();
+                while (it.next()) |entry| {
+                    const screen = entry.value.*;
+                    screen.kitty_images.image_limits.temporary_file = .{
+                        .enabled = .{ .directory = wrapper.tmp_dir_path[0..v.len] },
+                    };
+                }
+            } else {
+                var it = wrapper.terminal.screens.all.iterator();
+                while (it.next()) |entry| {
+                    const screen = entry.value.*;
+                    screen.kitty_images.image_limits.temporary_file = .disabled;
                 }
             }
         },
@@ -595,6 +711,12 @@ fn setTyped(
             const blink = if (value) |ptr| ptr.* else false;
             wrapper.terminal.setDefaultCursorBlink(blink);
         },
+        .scrollback_max_bytes => wrapper.terminal.setScrollbackMaxBytes(
+            if (value) |ptr| ptr.* else null,
+        ),
+        .scrollback_max_lines => wrapper.terminal.setScrollbackMaxLines(
+            if (value) |ptr| ptr.* else null,
+        ),
     }
     return .success;
 }
@@ -734,6 +856,8 @@ pub const TerminalData = enum(c_int) {
     selection = 31,
     viewport_active = 32,
     vt_processing_error = 33,
+    scrollback_max_bytes = 34,
+    scrollback_max_lines = 35,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -751,7 +875,11 @@ pub const TerminalData = enum(c_int) {
             .scrollbar => TerminalScrollbar,
             .cursor_style => style_c.Style,
             .title, .pwd => lib.String,
-            .total_rows, .scrollback_rows => usize,
+            .total_rows,
+            .scrollback_rows,
+            .scrollback_max_bytes,
+            .scrollback_max_lines,
+            => usize,
             .width_px, .height_px => u32,
             .color_foreground,
             .color_background,
@@ -763,9 +891,9 @@ pub const TerminalData = enum(c_int) {
             .color_palette, .color_palette_default => color.PaletteC,
             .kitty_image_storage_limit => u64,
             .kitty_image_medium_file,
-            .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
             => bool,
+            .kitty_image_medium_temp_file => lib.String,
             .kitty_graphics => KittyGraphics,
             .selection => selection_c.CSelection,
         };
@@ -778,7 +906,7 @@ pub fn get(
     out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(TerminalData, @intFromEnum(data)) catch {
+        _ = std.enums.fromInt(TerminalData, @intFromEnum(data)) orelse {
             log.warn("terminal_get invalid data value={d}", .{@intFromEnum(data)});
             return .invalid_value;
         };
@@ -868,7 +996,11 @@ fn getTyped(
         },
         .kitty_image_medium_temp_file => {
             if (comptime !build_options.kitty_graphics) return .no_value;
-            out.* = t.screens.active.kitty_images.image_limits.temporary_file;
+            const dir = switch (t.screens.active.kitty_images.image_limits.temporary_file) {
+                .enabled => |d| d.directory,
+                .disabled => "",
+            };
+            out.* = .{ .ptr = dir.ptr, .len = dir.len };
         },
         .kitty_image_medium_shared_mem => {
             if (comptime !build_options.kitty_graphics) return .no_value;
@@ -883,6 +1015,16 @@ fn getTyped(
         ),
         .viewport_active => out.* = t.screens.active.pages.viewport == .active,
         .vt_processing_error => out.* = wrapper.stream.handler.semantic_failure,
+        .scrollback_max_bytes => {
+            const max = t.screens.get(.primary).?.pages.limits.bytes.explicit;
+            if (max == std.math.maxInt(usize)) return .no_value;
+            out.* = max;
+        },
+        .scrollback_max_lines => {
+            const max = t.screens.get(.primary).?.pages.limits.lines.explicit;
+            if (max == std.math.maxInt(usize)) return .no_value;
+            out.* = max;
+        },
     }
 
     return .success;
@@ -967,6 +1109,11 @@ pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
     wrapper.tracked_grid_refs.deinit(alloc);
     wrapper.stream.deinit();
     t.deinit(alloc);
+    if (builtin.os.tag != .freestanding) {
+        // Deinit is always safe to call, even for single-threaded instances
+        wrapper.io_impl.deinit();
+        alloc.destroy(wrapper.io_impl);
+    }
     alloc.destroy(t);
     alloc.destroy(wrapper);
 }
@@ -976,11 +1123,8 @@ test "new/free" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 10_000,
-        },
+        80,
+        24,
     ));
 
     try testing.expect(t != null);
@@ -993,24 +1137,71 @@ test "new invalid value" {
     try testing.expectEqual(Result.invalid_value, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 0,
-            .rows = 24,
-            .max_scrollback = 10_000,
-        },
+        0,
+        24,
     ));
     try testing.expect(t == null);
 
     try testing.expectEqual(Result.invalid_value, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 0,
-            .max_scrollback = 10_000,
-        },
+        80,
+        0,
     ));
     try testing.expect(t == null);
+}
+
+test "set scrollback limits" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        3,
+    ));
+    defer free(t);
+
+    const primary = t.?.terminal.screens.get(.primary).?;
+
+    const max_bytes: usize = 0;
+    try testing.expectEqual(
+        Result.success,
+        set(t, .scrollback_max_bytes, &max_bytes),
+    );
+    try testing.expectEqual(
+        @as(usize, 0),
+        primary.pages.limits.bytes.explicit,
+    );
+    try testing.expect(primary.no_scrollback);
+
+    try testing.expectEqual(
+        Result.success,
+        set(t, .scrollback_max_bytes, null),
+    );
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        primary.pages.limits.bytes.explicit,
+    );
+    try testing.expect(!primary.no_scrollback);
+
+    const max_lines: usize = 12;
+    try testing.expectEqual(
+        Result.success,
+        set(t, .scrollback_max_lines, &max_lines),
+    );
+    try testing.expectEqual(
+        max_lines,
+        primary.pages.limits.lines.explicit,
+    );
+
+    try testing.expectEqual(
+        Result.success,
+        set(t, .scrollback_max_lines, null),
+    );
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        primary.pages.limits.lines.explicit,
+    );
 }
 
 test "free null" {
@@ -1022,11 +1213,8 @@ test "scroll_viewport" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 5,
-            .rows = 2,
-            .max_scrollback = 10_000,
-        },
+        5,
+        2,
     ));
     defer free(t);
 
@@ -1084,11 +1272,8 @@ test "scroll_viewport row" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 5,
-            .rows = 2,
-            .max_scrollback = 10_000,
-        },
+        5,
+        2,
     ));
     defer free(t);
 
@@ -1144,11 +1329,8 @@ test "scroll_viewport row alt screen" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 5,
-            .rows = 2,
-            .max_scrollback = 10_000,
-        },
+        5,
+        2,
     ));
     defer free(t);
 
@@ -1197,11 +1379,8 @@ test "compression invalid arguments" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 10_000_000,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1224,11 +1403,8 @@ test "compression activity and incremental scheduling" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 10_000_000,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1291,11 +1467,8 @@ test "reset" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 10_000,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1316,11 +1489,8 @@ test "resize" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 10_000,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1338,11 +1508,8 @@ test "resize invalid value" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 10_000,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1355,11 +1522,8 @@ test "resize shrinks both axes with cursor at bottom" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1379,11 +1543,8 @@ test "mode_get and mode_set" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1425,11 +1586,8 @@ test "mode_get unknown mode" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1443,11 +1601,8 @@ test "mode_set unknown mode" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1460,11 +1615,8 @@ test "vt_write" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 10_000,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1480,11 +1632,8 @@ test "vt_write split escape sequence" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 10_000,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1505,11 +1654,8 @@ test "vt_write split combining mark after base at right edge" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 2,
-            .rows = 2,
-            .max_scrollback = 0,
-        },
+        2,
+        2,
     ));
     defer free(t);
 
@@ -1528,11 +1674,8 @@ test "get cols and rows" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1549,11 +1692,8 @@ test "get cursor position" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1572,11 +1712,8 @@ test "get vt_processing_error" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1625,11 +1762,8 @@ test "get cursor_visible" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1649,11 +1783,8 @@ test "get active_screen" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1667,11 +1798,8 @@ test "get kitty_keyboard_flags" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1691,11 +1819,8 @@ test "get mouse_tracking" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1741,11 +1866,8 @@ test "get total_rows" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 10_000,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1759,11 +1881,8 @@ test "get scrollback_rows" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 3,
-            .max_scrollback = 10_000,
-        },
+        80,
+        3,
     ));
     defer free(t);
 
@@ -1778,16 +1897,87 @@ test "get scrollback_rows" {
     try testing.expectEqual(@as(usize, 2), scrollback);
 }
 
+test "get configured scrollback limits" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        3,
+    ));
+    defer free(t);
+
+    var value: usize = undefined;
+    try testing.expectEqual(
+        Result.success,
+        get(t, .scrollback_max_bytes, @ptrCast(&value)),
+    );
+    try testing.expectEqual(@as(usize, 10_000), value);
+    try testing.expectEqual(
+        Result.no_value,
+        get(t, .scrollback_max_lines, @ptrCast(&value)),
+    );
+
+    const max_bytes: usize = 0;
+    const max_lines: usize = 12;
+    try testing.expectEqual(
+        Result.success,
+        set(t, .scrollback_max_bytes, &max_bytes),
+    );
+    try testing.expectEqual(
+        Result.success,
+        set(t, .scrollback_max_lines, &max_lines),
+    );
+    try testing.expectEqual(
+        Result.success,
+        get(t, .scrollback_max_bytes, @ptrCast(&value)),
+    );
+    try testing.expectEqual(max_bytes, value);
+    try testing.expectEqual(
+        Result.success,
+        get(t, .scrollback_max_lines, @ptrCast(&value)),
+    );
+    try testing.expectEqual(max_lines, value);
+
+    // The configured limits belong to the primary screen and remain
+    // readable while an alternate screen is active.
+    vt_write(t, "\x1b[?1049h", 8);
+    try testing.expectEqual(
+        Result.success,
+        get(t, .scrollback_max_bytes, @ptrCast(&value)),
+    );
+    try testing.expectEqual(max_bytes, value);
+    try testing.expectEqual(
+        Result.success,
+        get(t, .scrollback_max_lines, @ptrCast(&value)),
+    );
+    try testing.expectEqual(max_lines, value);
+
+    try testing.expectEqual(
+        Result.success,
+        set(t, .scrollback_max_bytes, null),
+    );
+    try testing.expectEqual(
+        Result.success,
+        set(t, .scrollback_max_lines, null),
+    );
+    try testing.expectEqual(
+        Result.no_value,
+        get(t, .scrollback_max_bytes, @ptrCast(&value)),
+    );
+    try testing.expectEqual(
+        Result.no_value,
+        get(t, .scrollback_max_lines, @ptrCast(&value)),
+    );
+}
+
 test "get invalid" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1799,11 +1989,8 @@ test "set default cursor style and blink" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1844,11 +2031,8 @@ test "set and get selection" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1892,11 +2076,8 @@ test "selection derivation helpers" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -1982,11 +2163,8 @@ test "selection_adjust mutates snapshot end" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2030,11 +2208,8 @@ test "selection_order and selection_ordered" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2083,11 +2258,8 @@ test "selection_contains" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2141,11 +2313,8 @@ test "selection_equal" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2153,11 +2322,8 @@ test "selection_equal" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &other_t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(other_t);
 
@@ -2230,11 +2396,8 @@ test "selection_order invalid values" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2248,11 +2411,8 @@ test "grid_ref" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2286,7 +2446,8 @@ test "point_from_grid_ref roundtrip active" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{ .cols = 80, .rows = 24, .max_scrollback = 10_000 },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2311,7 +2472,8 @@ test "point_from_grid_ref roundtrip viewport" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{ .cols = 80, .rows = 24, .max_scrollback = 10_000 },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2334,7 +2496,8 @@ test "point_from_grid_ref history ref to active returns no_value" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{ .cols = 80, .rows = 4, .max_scrollback = 10_000 },
+        80,
+        4,
     ));
     defer free(t);
 
@@ -2369,7 +2532,8 @@ test "point_from_grid_ref null node" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2382,11 +2546,8 @@ test "set write_pty callback" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2420,16 +2581,45 @@ test "set write_pty callback" {
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
 }
 
+test "write_pty receives DECRQSS response" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+
+        fn deinit() void {
+            if (last_data) |data| testing.allocator.free(data);
+            last_data = null;
+        }
+
+        fn writePty(_: Terminal, _: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(lib.calling_conv) void {
+            if (last_data) |data| testing.allocator.free(data);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+    };
+    defer S.deinit();
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+
+    const query = "\x1B[1m\x1BP$qm\x1B\\";
+    vt_write(t, query, query.len);
+    try testing.expectEqualStrings("\x1BP1$r0;1m\x1B\\", S.last_data.?);
+}
+
 test "write_pty receives OSC color query response" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2465,11 +2655,8 @@ test "set write_pty without callback ignores queries" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2482,11 +2669,8 @@ test "set write_pty null clears callback" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2511,11 +2695,8 @@ test "set bell callback" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2551,11 +2732,8 @@ test "bell without callback is silent" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2568,11 +2746,8 @@ test "set enquiry callback" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2610,11 +2785,8 @@ test "enquiry without callback is silent" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2627,11 +2799,8 @@ test "set xtversion callback" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2670,11 +2839,8 @@ test "xtversion without callback reports default" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2706,11 +2872,8 @@ test "set title_changed callback" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2745,11 +2908,8 @@ test "title_changed without callback is silent" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2757,16 +2917,158 @@ test "title_changed without callback is silent" {
     vt_write(t, "\x1B]2;Hello\x1B\\", 10);
 }
 
+test "set desktop_notification callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var count: usize = 0;
+        var last_userdata: ?*anyopaque = null;
+        var last_size: usize = 0;
+        var title: [64]u8 = undefined;
+        var title_len: usize = 0;
+        var body: [64]u8 = undefined;
+        var body_len: usize = 0;
+
+        fn desktopNotification(
+            _: Terminal,
+            ud: ?*anyopaque,
+            notification: *const DesktopNotification,
+        ) callconv(lib.calling_conv) void {
+            count += 1;
+            last_userdata = ud;
+            last_size = notification.size;
+            title_len = notification.title.len;
+            body_len = notification.body.len;
+            @memcpy(title[0..title_len], notification.title.ptr[0..title_len]);
+            @memcpy(body[0..body_len], notification.body.ptr[0..body_len]);
+        }
+    };
+    S.count = 0;
+    S.last_userdata = null;
+    S.last_size = 0;
+    S.title_len = 0;
+    S.body_len = 0;
+
+    var sentinel: u8 = 99;
+    try testing.expectEqual(Result.success, set(t, .userdata, @ptrCast(&sentinel)));
+    try testing.expectEqual(Result.success, set(
+        t,
+        .desktop_notification,
+        @ptrCast(&S.desktopNotification),
+    ));
+
+    // Split OSC 777 across writes to exercise the persistent VT parser.
+    const seq_a = "\x1B]777;notify;Codex;";
+    const seq_b = "Needs attention\x1B\\";
+    vt_write(t, seq_a, seq_a.len);
+    try testing.expectEqual(@as(usize, 0), S.count);
+    vt_write(t, seq_b, seq_b.len);
+    try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
+    try testing.expectEqual(@sizeOf(DesktopNotification), S.last_size);
+    try testing.expectEqualStrings("Codex", S.title[0..S.title_len]);
+    try testing.expectEqualStrings("Needs attention", S.body[0..S.body_len]);
+
+    // OSC 9 has no title and preserves its body.
+    const seq_c = "\x1B]9;Build complete\x07";
+    vt_write(t, seq_c, seq_c.len);
+    try testing.expectEqual(@as(usize, 2), S.count);
+    try testing.expectEqualStrings("", S.title[0..S.title_len]);
+    try testing.expectEqualStrings("Build complete", S.body[0..S.body_len]);
+
+    // Removing the callback takes effect immediately.
+    try testing.expectEqual(Result.success, set(t, .desktop_notification, null));
+    vt_write(t, seq_c, seq_c.len);
+    try testing.expectEqual(@as(usize, 2), S.count);
+}
+
+test "set progress_report callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var count: usize = 0;
+        var last_userdata: ?*anyopaque = null;
+        var last_size: usize = 0;
+        var last_state: ProgressState = .remove;
+        var last_progress: i8 = -1;
+
+        fn progressReport(
+            _: Terminal,
+            ud: ?*anyopaque,
+            report: *const ProgressReport,
+        ) callconv(lib.calling_conv) void {
+            count += 1;
+            last_userdata = ud;
+            last_size = report.size;
+            last_state = report.state;
+            last_progress = report.progress;
+        }
+    };
+    S.count = 0;
+    S.last_userdata = null;
+    S.last_size = 0;
+    S.last_state = .remove;
+    S.last_progress = -1;
+
+    var sentinel: u8 = 100;
+    try testing.expectEqual(Result.success, set(t, .userdata, @ptrCast(&sentinel)));
+    try testing.expectEqual(Result.success, set(
+        t,
+        .progress_report,
+        @ptrCast(&S.progressReport),
+    ));
+
+    const cases = [_]struct {
+        sequence: []const u8,
+        state: ProgressState,
+        progress: i8,
+    }{
+        .{ .sequence = "\x1B]9;4;0;\x1B\\", .state = .remove, .progress = -1 },
+        .{ .sequence = "\x1B]9;4;1;42\x07", .state = .set, .progress = 42 },
+        .{ .sequence = "\x1B]9;4;2;7\x1B\\", .state = .@"error", .progress = 7 },
+        .{ .sequence = "\x1B]9;4;3\x1B\\", .state = .indeterminate, .progress = -1 },
+        .{ .sequence = "\x1B]9;4;4;75\x1B\\", .state = .pause, .progress = 75 },
+    };
+
+    for (cases, 1..) |case, expected_count| {
+        const midpoint = case.sequence.len / 2;
+        vt_write(t, case.sequence.ptr, midpoint);
+        try testing.expectEqual(expected_count - 1, S.count);
+        vt_write(t, case.sequence.ptr + midpoint, case.sequence.len - midpoint);
+        try testing.expectEqual(expected_count, S.count);
+        try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
+        try testing.expectEqual(@sizeOf(ProgressReport), S.last_size);
+        try testing.expectEqual(case.state, S.last_state);
+        try testing.expectEqual(case.progress, S.last_progress);
+    }
+
+    try testing.expectEqual(Result.success, set(t, .progress_report, null));
+    const ignored = "\x1B]9;4;1;90\x1B\\";
+    vt_write(t, ignored, ignored.len);
+    try testing.expectEqual(@as(usize, cases.len), S.count);
+}
+
 test "set pwd_changed callback" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2805,11 +3107,8 @@ test "set clipboard_write callback" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2960,11 +3259,8 @@ test "clipboard_write without callback is unsupported and silent" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -2985,11 +3281,8 @@ test "pwd_changed without callback is silent" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3004,11 +3297,8 @@ test "set size callback" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3051,11 +3341,8 @@ test "size without callback is silent" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3068,11 +3355,8 @@ test "set device_attributes callback primary" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3122,11 +3406,8 @@ test "set device_attributes callback secondary" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3176,11 +3457,8 @@ test "set device_attributes callback tertiary" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3230,11 +3508,8 @@ test "device_attributes without callback uses default" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3266,11 +3541,8 @@ test "device_attributes callback returns false uses default" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3307,11 +3579,8 @@ test "set and get title" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3346,11 +3615,8 @@ test "set and get pwd" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3378,11 +3644,8 @@ test "get title set via vt_write" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3399,11 +3662,8 @@ test "resize updates pixel dimensions" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3420,11 +3680,8 @@ test "resize pixel overflow saturates" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3440,11 +3697,8 @@ test "resize disables synchronized output" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3461,11 +3715,8 @@ test "resize sends in-band size report" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3502,11 +3753,8 @@ test "resize no size report without mode 2048" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3530,11 +3778,8 @@ test "resize in-band report without write_pty callback" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3552,11 +3797,8 @@ test "resize zero cols" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3568,11 +3810,8 @@ test "resize zero rows" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3584,11 +3823,8 @@ test "grid_ref out of bounds" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3604,11 +3840,8 @@ test "set and get color_foreground" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3632,11 +3865,8 @@ test "set and get color_background" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3657,11 +3887,8 @@ test "set and get color_cursor" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3682,11 +3909,8 @@ test "set and get color_palette" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3713,11 +3937,8 @@ test "get color default vs effective with override" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3760,11 +3981,8 @@ test "get color default returns no_value when unset" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3779,11 +3997,8 @@ test "get color_palette_default vs current" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3812,11 +4027,8 @@ test "set color sets dirty flag" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 0,
-        },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3833,7 +4045,8 @@ test "set glyph protocol disables APC handling and clears glossary" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3860,7 +4073,8 @@ test "get_multi success" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+        80,
+        24,
     ));
     defer free(t);
 
@@ -3881,7 +4095,8 @@ test "get_multi error sets out_written" {
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
         &t,
-        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+        80,
+        24,
     ));
     defer free(t);
 

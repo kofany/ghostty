@@ -74,12 +74,7 @@ GhosttyClipboardWriteResult on_clipboard_write(
 int main() {
   // Create a terminal
   GhosttyTerminal terminal = NULL;
-  GhosttyTerminalOptions opts = {
-    .cols = 80,
-    .rows = 24,
-    .max_scrollback = 0,
-  };
-  if (ghostty_terminal_new(NULL, &terminal, opts) != GHOSTTY_SUCCESS) {
+  if (ghostty_terminal_new(NULL, &terminal, 80, 24) != GHOSTTY_SUCCESS) {
     fprintf(stderr, "Failed to create terminal\n");
     return 1;
   }

@@ -68,7 +68,8 @@ pub const structs: std.StaticStringMap(StructInfo) = structs: {
         .{ "GhosttySurfacePosition", StructInfo.init(SurfacePosition) },
         .{ "GhosttyStyle", StructInfo.init(style_c.Style) },
         .{ "GhosttyStyleColor", StructInfo.init(style_c.Color) },
-        .{ "GhosttyTerminalOptions", StructInfo.init(terminal.Options) },
+        .{ "GhosttyTerminalDesktopNotification", StructInfo.init(terminal.DesktopNotification) },
+        .{ "GhosttyTerminalProgressReport", StructInfo.init(terminal.ProgressReport) },
         .{ "GhosttyTerminalScrollbar", StructInfo.init(terminal.TerminalScrollbar) },
         .{ "GhosttyTerminalScrollViewport", StructInfo.init(terminal.ScrollViewport) },
     });
@@ -216,7 +217,6 @@ test "json parses" {
     // Verify we have all expected structs
     try std.testing.expect(root.contains("GhosttyClipboardContent"));
     try std.testing.expect(root.contains("GhosttyClipboardWrite"));
-    try std.testing.expect(root.contains("GhosttyTerminalOptions"));
     try std.testing.expect(root.contains("GhosttyFormatterTerminalOptions"));
 
     const clipboard_content = root.get("GhosttyClipboardContent").?.object;
@@ -231,20 +231,7 @@ test "json parses" {
     try std.testing.expect(clipboard_write_fields.contains("contents"));
     try std.testing.expect(clipboard_write_fields.contains("contents_len"));
 
-    // Verify GhosttyTerminalOptions fields
-    const term_opts = root.get("GhosttyTerminalOptions").?.object;
-    try std.testing.expect(term_opts.contains("size"));
-    try std.testing.expect(term_opts.contains("align"));
-    try std.testing.expect(term_opts.contains("fields"));
-
-    const fields = term_opts.get("fields").?.object;
-    try std.testing.expect(fields.contains("cols"));
-    try std.testing.expect(fields.contains("rows"));
-    try std.testing.expect(fields.contains("max_scrollback"));
-
-    // Verify field offsets make sense (cols should be at 0)
-    const cols = fields.get("cols").?.object;
-    try std.testing.expectEqual(0, cols.get("offset").?.integer);
+    try std.testing.expect(!root.contains("GhosttyTerminalOptions"));
 }
 
 test "struct sizes are non-zero" {
