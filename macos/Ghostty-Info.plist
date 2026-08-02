@@ -4,6 +4,13 @@
 <dict>
 	<key>NSAutoFillRequiresTextContentTypeForOneTimeCodeOnMac</key>
 	<true/>
+	<!-- Browsing for this is how the "Grant Local Network Access" menu item
+	     gets macOS to offer us the local network permission. Bonjour browsing
+	     is rejected outright for service types not declared here. -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_ssh._tcp</string>
+	</array>
 	<key>NSDockTilePlugIn</key>
 	<string>DockTilePlugin.plugin</string>
 	<key>CFBundleDocumentTypes</key>

@@ -65,6 +65,7 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuFloatOnTop: NSMenuItem?
     @IBOutlet private var menuUseAsDefault: NSMenuItem?
     @IBOutlet private var menuSetAsDefaultTerminal: NSMenuItem?
+    @IBOutlet private var menuGrantLocalNetworkAccess: NSMenuItem?
 
     @IBOutlet private var menuIncreaseFontSize: NSMenuItem?
     @IBOutlet private var menuDecreaseFontSize: NSMenuItem?
@@ -1118,6 +1119,7 @@ extension AppDelegate {
         self.menuTerminalInspector?.setImageIfDesired(systemSymbolName: "scope")
         self.menuReadonly?.setImageIfDesired(systemSymbolName: "eye.fill")
         self.menuSetAsDefaultTerminal?.setImageIfDesired(systemSymbolName: "star.fill")
+        self.menuGrantLocalNetworkAccess?.setImageIfDesired(systemSymbolName: "network")
         self.menuToggleFullScreen?.setImageIfDesired(systemSymbolName: "square.arrowtriangle.4.outward")
         self.menuToggleVisibility?.setImageIfDesired(systemSymbolName: "eye")
         self.menuZoomSplit?.setImageIfDesired(systemSymbolName: "arrow.up.left.and.arrow.down.right")
@@ -1260,6 +1262,36 @@ extension AppDelegate {
                 alert.alertStyle = .warning
                 alert.runModal()
             }
+        }
+    }
+
+    @IBAction func grantLocalNetworkAccess(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Grant Local Network Access"
+        alert.informativeText = """
+        macOS only offers the local network permission to an app that reaches for the \
+        local network, and Ghostty never does that on its own. Programs you run in the \
+        terminal go through Ghostty's permissions, so until Ghostty is granted access \
+        they can't reach anything on your LAN.
+
+        Ghostty can make a few connection attempts on your local network now so that \
+        macOS shows its permission prompt. Choose "Allow" when it appears; that grant \
+        covers the commands you run in the terminal too.
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Open System Settings…")
+        alert.addButton(withTitle: "Cancel")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            LocalNetworkAccess.shared.request()
+
+        case .alertSecondButtonReturn:
+            LocalNetworkAccess.openSystemSettings()
+
+        default:
+            break
         }
     }
 }
