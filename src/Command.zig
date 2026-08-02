@@ -230,7 +230,7 @@ fn startPosix(self: *Command, arena: Allocator) !void {
         // offload to execve below.
         const file_slice = std.mem.sliceTo(self.path, 0);
         if (std.mem.findScalar(u8, file_slice, '/') != null) {
-            break :execve execveZ(self.path, argsZ, envp);
+            break :execve posix.errno(posix.system.execve(self.path, argsZ, envp));
         }
 
         var path_expanded_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -249,7 +249,7 @@ fn startPosix(self: *Command, arena: Allocator) !void {
             const full_path = path_expanded_buf[0..path_len :0].ptr;
             // Replace here, switch on error (any error means that replace
             // failed, but we might need to retry).
-            err = execveZ(full_path, argsZ, envp);
+            err = posix.errno(posix.system.execve(full_path, argsZ, envp));
             switch (err) {
                 .ACCES => seen_eacces = true,
                 .NOENT, .NOTDIR => {},
@@ -289,59 +289,6 @@ fn startPosix(self: *Command, arena: Allocator) !void {
     // We return a very specific error that can be detected to determine
     // we're in the child.
     return error.ExecFailedInChild;
-}
-
-/// Replace the current process image, i.e. `execve(2)`. This only returns if
-/// the exec failed, in which case the errno is returned.
-///
-/// On macOS we route this through `posix_spawn` with `POSIX_SPAWN_SETEXEC`
-/// instead of calling `execve` directly. `SETEXEC` replaces the image of the
-/// calling process in place rather than creating a new process, so our pid,
-/// session, controlling terminal, file descriptors and working directory are
-/// all preserved; the only thing this buys us over `execve` is that we get to
-/// set spawn attributes, and the attribute we want is "disclaim".
-///
-/// Disclaiming makes the new process image responsible for itself as far as
-/// TCC (privacy) is concerned, instead of it inheriting Ghostty as its
-/// responsible process. Terminal.app and iTerm2 both do this. Without it,
-/// every process the user runs in the terminal is attributed to Ghostty, so it
-/// is Ghostty that needs the privacy permissions. That silently breaks local
-/// network access on macOS 26+: Ghostty is never prompted for the local
-/// network permission, so the request is denied and connecting to any LAN
-/// address fails with EHOSTUNREACH while the internet at large still works.
-///
-/// If setting up the spawn attributes fails for any reason we fall back to a
-/// plain `execve` so that this can never keep the shell from starting.
-fn execveZ(
-    path: [*:0]const u8,
-    argv: [*:null]const ?[*:0]const u8,
-    envp: [*:null]const ?[*:0]const u8,
-) posix.E {
-    if (comptime builtin.os.tag.isDarwin()) darwin: {
-        const libsystem = struct {
-            /// Private libSystem API, there is no public header for this.
-            extern "c" fn responsibility_spawnattrs_setdisclaim(
-                attr: *std.c.posix_spawnattr_t,
-                disclaim: c_int,
-            ) c_int;
-        };
-
-        var attr: std.c.posix_spawnattr_t = undefined;
-        if (std.c.posix_spawnattr_init(&attr) != 0) break :darwin;
-        defer _ = std.c.posix_spawnattr_destroy(&attr);
-        if (libsystem.responsibility_spawnattrs_setdisclaim(&attr, 1) != 0) break :darwin;
-        if (std.c.posix_spawnattr_setflags(&attr, .{ .SETEXEC = true }) != 0) break :darwin;
-
-        // Never written to since `SETEXEC` replaces this process rather than
-        // creating one, but the API requires somewhere to put it.
-        var pid: std.c.pid_t = undefined;
-
-        // Unlike the exec family, posix_spawn reports failure by returning the
-        // errno rather than by setting it.
-        return @enumFromInt(std.c.posix_spawn(&pid, path, null, &attr, argv, envp));
-    }
-
-    return posix.errno(posix.system.execve(path, argv, envp));
 }
 
 /// Wrapper for the raw fork syscall. This preserves the error handling from
